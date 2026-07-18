@@ -162,7 +162,10 @@ else
   error('No EGL driver available.')
 endif
 
-if cc.has_function('mincore')
+# etos: mlibc only declares mincore() under its (unsupported here) 'linux'
+# option, but a same-named stub happens to be link-visible in libc.a, which
+# is enough for cc.has_function()'s link-only fallback to false-positive.
+if host_machine.system() != 'etos' and cc.has_function('mincore')
   c_args_for_egl += '-DHAVE_MINCORE'
 endif
 
@@ -204,25 +207,47 @@ if egl_native_platform != ''
   c_args_for_egl += '-D_EGL_NATIVE_PLATFORM=_EGL_PLATFORM_@0@'.format(egl_native_platform.to_upper())
 endif
 
-libegl = shared_library(
-  egl_lib_name,
-  files_egl,
-  c_args : [
-    c_args_for_egl,
-  ],
-  cpp_args : [cpp_args_for_egl],
-  gnu_symbol_visibility : 'hidden',
-  include_directories : incs_for_egl,
-  link_with : [link_for_egl],
-  link_args : [ld_args_bsymbolic, ld_args_gc_sections, link_args_for_egl],
-  link_depends : [link_deps_for_egl],
-  dependencies : [deps_for_egl, dep_dl, dep_libdrm, dep_clock, dep_thread, idep_mesautil],
-  install : true,
-  version : egl_lib_version,
-  soversion : egl_lib_soversion,
-  name_prefix : host_machine.system() == 'windows' ? 'lib' : [],  # always use lib, but avoid warnings on !windows
-  vs_module_defs : egl_def
-)
+# etos: built as a static_library instead of shared_library — etos has no
+# dynamic linker/dlopen, everything ships as one static-PIE binary. The
+# version/soversion/vs_module_defs/name_prefix kwargs below are shared-library
+# only and are dropped accordingly (get_option('etos-software-only') is the
+# same opt-in this build enables DRI/EGL with in the top-level meson.build).
+if get_option('etos-software-only')
+  libegl = static_library(
+    egl_lib_name,
+    files_egl,
+    c_args : [
+      c_args_for_egl,
+    ],
+    cpp_args : [cpp_args_for_egl],
+    gnu_symbol_visibility : 'hidden',
+    include_directories : incs_for_egl,
+    link_with : [link_for_egl],
+    link_depends : [link_deps_for_egl],
+    dependencies : [deps_for_egl, dep_dl, dep_libdrm, dep_clock, dep_thread, idep_mesautil],
+    install : false,
+  )
+else
+  libegl = shared_library(
+    egl_lib_name,
+    files_egl,
+    c_args : [
+      c_args_for_egl,
+    ],
+    cpp_args : [cpp_args_for_egl],
+    gnu_symbol_visibility : 'hidden',
+    include_directories : incs_for_egl,
+    link_with : [link_for_egl],
+    link_args : [ld_args_bsymbolic, ld_args_gc_sections, link_args_for_egl],
+    link_depends : [link_deps_for_egl],
+    dependencies : [deps_for_egl, dep_dl, dep_libdrm, dep_clock, dep_thread, idep_mesautil],
+    install : true,
+    version : egl_lib_version,
+    soversion : egl_lib_soversion,
+    name_prefix : host_machine.system() == 'windows' ? 'lib' : [],  # always use lib, but avoid warnings on !windows
+    vs_module_defs : egl_def
+  )
+endif
 
 if with_glvnd
   configure_file(

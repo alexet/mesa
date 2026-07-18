@@ -391,6 +391,19 @@ option(
 )
 
 option(
+  'etos-software-only',
+  type : 'boolean',
+  value : false,
+  description : 'Allow DRI/EGL to be enabled on a target with no KMS/DRM ' +
+                'support (system_has_kms_drm == false), for a software-only ' +
+                '(e.g. swrast/softpipe, EGL_PLATFORM_SURFACELESS_MESA) build ' +
+                'with no real GPU/DRM device. Not for general use: only ' +
+                'exists because system_has_kms_drm is a hardcoded OS ' +
+                'allowlist that a freestanding/microkernel host_machine.system() ' +
+                'can never match.'
+)
+
+option(
   'glvnd',
   type : 'feature',
   deprecated: {'true': 'enabled', 'false': 'disabled'},

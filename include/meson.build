@@ -11,6 +11,14 @@ if with_android_stub
   inc_include += [include_directories('android_stub')]
 endif
 
+# etos has no <sys/ioccom.h> (BSD ioctl-macro header, expected by
+# include/drm-uapi/drm.h's non-Linux branch) — the DRM ioctl paths that use
+# it are dead code for a software-only (swrast/softpipe) surfaceless build,
+# but still need to compile. See etos_compat/sys/ioccom.h.
+if host_machine.system() == 'etos'
+  inc_include += [include_directories('etos_compat')]
+endif
+
 if not with_glvnd and host_machine.system() != 'windows'
   if with_gles1 or with_gles2 or with_opengl or with_egl
     install_headers('KHR/khrplatform.h', subdir : 'KHR')

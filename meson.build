@@ -361,7 +361,7 @@ with_vdrm = [
 ].contains(true)
 
 with_dri = false
-if with_gallium and (system_has_kms_drm or (with_gallium_zink and (freedreno_kmds.contains('kgsl') or host_machine.system() == 'darwin')))
+if with_gallium and (system_has_kms_drm or get_option('etos-software-only') or (with_gallium_zink and (freedreno_kmds.contains('kgsl') or host_machine.system() == 'darwin')))
   _glx = get_option('glx')
   _egl = get_option('egl')
   if _glx == 'dri' or _egl.enabled() or (_glx == 'disabled' and _egl.allowed())
@@ -697,7 +697,14 @@ if with_vulkan_icd_dir == ''
   with_vulkan_icd_dir = join_paths(get_option('datadir'), 'vulkan/icd.d')
 endif
 
-with_dri2 = (with_dri or with_any_vk) and (with_dri_platform == 'drm' or with_dri_platform == 'apple' or  with_dri_platform == 'pseudo-drm')
+# etos: src/gallium/frontends/dri/dri_util.c's driCreateNewScreen3() switches
+# over all dri_screen_type variants (including DRI_SCREEN_DRI2/_KMS_SWRAST)
+# unconditionally at the C level — it's a runtime switch, not preprocessor-
+# gated — so dri2.c's symbols must be linkable even though the surfaceless/
+# software (DRI_SCREEN_SWRAST, drisw.c) path is the only one actually
+# reachable here. dri2.c itself degrades its real-DRM-specific code behind
+# #ifdef HAVE_LIBDRM (undefined for etos), so this is safe to enable.
+with_dri2 = (with_dri or with_any_vk) and (with_dri_platform == 'drm' or with_dri_platform == 'apple' or with_dri_platform == 'pseudo-drm' or get_option('etos-software-only'))
 
 if with_dri
   if with_glx == 'disabled' and not with_egl and not with_gbm
@@ -1593,7 +1600,11 @@ endif
 
 if cc.check_header('sched.h')
   pre_args += '-DHAS_SCHED_H'
-  if cc.has_function('sched_getaffinity')
+  # etos: mlibc's sched.h has no cpu_set_t/CPU_COUNT/sched_getaffinity
+  # declarations (no affinity support at all), but its libc.a happens to
+  # export a same-named stub symbol, which is enough for cc.has_function()'s
+  # link-only fallback to report a false positive here.
+  if host_machine.system() != 'etos' and cc.has_function('sched_getaffinity')
     pre_args += '-DHAS_SCHED_GETAFFINITY'
   endif
 endif
