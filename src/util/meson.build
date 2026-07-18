@@ -294,6 +294,10 @@ shader_stats_h = custom_target(
 )
 files_mesa_util += shader_stats_h
 
+if get_option('etos-software-only')
+  files_mesa_util += files('u_ioctl_stub_etos.c')
+endif
+
 # subdir format provide files_mesa_format
 subdir('format')
 files_mesa_util += files_mesa_format

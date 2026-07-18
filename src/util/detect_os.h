@@ -91,6 +91,19 @@
 #define DETECT_OS_POSIX 1
 #endif
 
+/*
+ * etos (https://github.com/alexet/etos): an object-capability microkernel
+ * with a mlibc-based POSIX-lite libc port (no real filesystem, no dlopen,
+ * see 3rd-party/mlibc/sysdeps/etos/) but working clock/thread/sleep syscalls
+ * — closest in shape to Fuchsia's DETECT_OS_POSIX_LITE, but mlibc's etos
+ * port implements enough (usleep, clock_gettime, syslog is not needed here
+ * since it degrades to a no-op) that plain DETECT_OS_POSIX is sufficient.
+ */
+#if defined(__etos__)
+#define DETECT_OS_ETOS 1
+#define DETECT_OS_POSIX 1
+#endif
+
 
 /*
  * Make sure DETECT_OS_* are always defined, so that they can be used with #if
@@ -145,6 +158,9 @@
 #endif
 #ifndef DETECT_OS_MANAGARM
 #define DETECT_OS_MANAGARM 0
+#endif
+#ifndef DETECT_OS_ETOS
+#define DETECT_OS_ETOS 0
 #endif
 
 #endif /* DETECT_OS_H */
