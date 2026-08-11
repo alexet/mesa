@@ -170,9 +170,15 @@ else
 endif
 if with_gallium_virgl
   subdir('winsys/virgl/common')
-  if not with_platform_windows
+  # etos has no libdrm (winsys/virgl/drm) and no vtest-server socket
+  # (winsys/virgl/vtest) to speak to -- see the etos-virgl option's doc and
+  # drivers/virgl/meson.build's matching virgl_deps guard.
+  if not with_platform_windows and not get_option('etos-virgl')
     subdir('winsys/virgl/drm')
     subdir('winsys/virgl/vtest')
+  endif
+  if get_option('etos-virgl')
+    subdir('winsys/virgl/etos')
   endif
   subdir('drivers/virgl')
 else

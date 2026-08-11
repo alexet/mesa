@@ -404,6 +404,22 @@ option(
 )
 
 option(
+  'etos-virgl',
+  type : 'boolean',
+  value : false,
+  description : 'Wire libgallium_dri\'s swrast/surfaceless screen-creation ' +
+                'path (see etos-software-only) to the virgl gallium driver, ' +
+                'backed by a new etos-native winsys ' +
+                '(src/gallium/winsys/virgl/etos) that talks the etos ' +
+                'GpuDevice/GpuContext capability protocol instead of DRM ' +
+                'ioctls or the vtest socket protocol -- a separate build ' +
+                'variant selected at Meson-configure time, not a runtime ' +
+                'choice. Requires etos-software-only; mutually exclusive ' +
+                'in practice with a llvmpipe-only build (see ' +
+                'tools/build-mesa-virgl.sh vs. tools/build-mesa.sh).'
+)
+
+option(
   'glvnd',
   type : 'feature',
   deprecated: {'true': 'enabled', 'false': 'disabled'},

@@ -33,10 +33,26 @@
 #include "virgl/vtest/virgl_vtest_public.h"
 #endif
 
+/* etos: a build-time-selected variant (see the etos-virgl Meson option's
+ * doc), never both this and GALLIUM_LLVMPIPE/GALLIUM_SOFTPIPE/etc in the
+ * same build -- construct the etos-native virgl_winsys directly and hand it
+ * to virgl_create_screen(), bypassing the generic `sw_winsys*`-wrapping
+ * "virpipe" path below entirely (that one talks the vtest socket protocol,
+ * not etos's GpuDevice/GpuContext capabilities -- see
+ * src/gallium/winsys/virgl/etos/virgl_etos_winsys.c's header). */
+#ifdef GALLIUM_VIRGL_ETOS
+#include "virgl/etos/virgl_etos_winsys.h"
+#endif
+
 static inline struct pipe_screen *
 sw_screen_create_named(struct sw_winsys *winsys, const struct pipe_screen_config *config, const char *driver)
 {
    struct pipe_screen *screen = NULL;
+
+#if defined(GALLIUM_VIRGL_ETOS)
+   if (screen == NULL && (strcmp(driver, "virgl-etos") == 0 || !driver[0]))
+      screen = virgl_etos_create_screen(config);
+#endif
 
 #if defined(GALLIUM_LLVMPIPE)
    if (screen == NULL && (strcmp(driver, "llvmpipe") == 0 || !driver[0]))
