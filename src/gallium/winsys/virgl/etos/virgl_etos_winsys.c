@@ -44,7 +44,7 @@ extern int etos_virgl_get_capset(uint32_t capset_id, uint32_t version, uint8_t *
 extern int etos_virgl_resource_create(uint64_t size, uint32_t virgl_format, uint32_t image_type,
                                        uint32_t width, uint32_t height, uint32_t depth,
                                        uint32_t layers, uint32_t mip_levels, uint32_t samples,
-                                       uint32_t *out_handle);
+                                       uint32_t bind, uint32_t *out_handle);
 extern int etos_virgl_resource_destroy(uint32_t handle);
 extern int etos_virgl_resource_size(uint32_t handle, uint64_t *out_size);
 extern int etos_virgl_resource_map(uint32_t handle, void **out_ptr);
@@ -104,7 +104,7 @@ virgl_etos_resource_create(struct virgl_winsys *vws,
    uint32_t handle;
 
    if (etos_virgl_resource_create(size, virgl_format, image_type, width, height, depth,
-                                   array_size, last_level + 1, nr_samples, &handle) != 0)
+                                   array_size, last_level + 1, nr_samples, bind, &handle) != 0)
       return NULL;
 
    struct virgl_hw_res *res = CALLOC_STRUCT(virgl_hw_res);
@@ -281,18 +281,50 @@ virgl_etos_res_is_referenced(UNUSED struct virgl_winsys *vws, UNUSED struct virg
    return false;
 }
 
+/* VIRTIO_GPU_CAPSET_VIRGL / _VIRGL2 (virtio_gpu.h): GET_CAPSET_INFO's
+ * `capset_index` is an *enumeration position*, not the capset id itself --
+ * a host offering both capsets reports VIRGL (id 1, GLSL capped around
+ * 1.40/ES 3.00 -- exactly the "GLSL 3.30 is not supported" failure this
+ * fixes) and VIRGL2 (id 2, real GL 3.3+ core support) at *different*
+ * indices. virgl_drm_winsys.c's own get_caps() asks for cap_set_id=2
+ * directly (a DRM ioctl parameter, falling back to 1 on EINVAL) since Linux
+ * lets it address a capset by id; virtio-gpu's GET_CAPSET_INFO has no such
+ * shortcut, so this searches every index for id 2 first. */
+#define VIRGL_CAPSET_VIRGL 1
+#define VIRGL_CAPSET_VIRGL2 2
+#define VIRGL_CAPSET_MAX_INDEX 8
+
 static int
 virgl_etos_get_caps(UNUSED struct virgl_winsys *vws, struct virgl_drm_caps *caps)
 {
    virgl_ws_fill_new_caps_defaults(caps);
 
-   uint32_t capset_id, max_version, max_size;
-   if (etos_virgl_get_capset_info(0, &capset_id, &max_version, &max_size) != 0)
+   uint32_t best_capset_id = 0, best_max_version = 0, best_max_size = 0;
+   for (uint32_t index = 0; index < VIRGL_CAPSET_MAX_INDEX; index++) {
+      uint32_t capset_id, max_version, max_size;
+      if (etos_virgl_get_capset_info(index, &capset_id, &max_version, &max_size) != 0)
+         break; /* no more capsets at or past this index */
+
+      if (capset_id == VIRGL_CAPSET_VIRGL2) {
+         best_capset_id = capset_id;
+         best_max_version = max_version;
+         best_max_size = max_size;
+         break; /* VIRGL2 is strictly better than VIRGL -- stop searching */
+      }
+      if (best_capset_id == 0 && capset_id == VIRGL_CAPSET_VIRGL) {
+         best_capset_id = capset_id;
+         best_max_version = max_version;
+         best_max_size = max_size;
+         /* keep searching in case a later index offers VIRGL2 */
+      }
+   }
+   if (best_capset_id == 0)
       return -1;
 
-   size_t copy_len = max_size < sizeof(caps->caps) ? max_size : sizeof(caps->caps);
+   size_t copy_len = best_max_size < sizeof(caps->caps) ? best_max_size : sizeof(caps->caps);
    size_t written = 0;
-   if (etos_virgl_get_capset(capset_id, max_version, (uint8_t *)&caps->caps, copy_len, &written) != 0)
+   if (etos_virgl_get_capset(best_capset_id, best_max_version, (uint8_t *)&caps->caps, copy_len,
+                              &written) != 0)
       return -1;
 
    return 0;
