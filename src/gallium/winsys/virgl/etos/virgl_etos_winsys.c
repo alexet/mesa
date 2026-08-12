@@ -246,15 +246,26 @@ virgl_etos_cmd_buf_destroy(struct virgl_cmd_buf *buf)
 
 static void
 virgl_etos_emit_res(UNUSED struct virgl_winsys *vws, struct virgl_cmd_buf *buf,
-                     struct virgl_hw_res *res, UNUSED bool write_buffer)
+                     struct virgl_hw_res *res, bool write_buffer)
 {
    /* Every resource is already CTX_ATTACH_RESOURCE'd to this context at
     * bind() time (drivers/virtio-gpud/src/gpu_context.rs), so unlike the
     * DRM winsys's emit_res (which also builds a bo_handles list consumed by
-    * the EXECBUFFER ioctl) this only needs to write the resource handle
-    * dword Mesa's command encoder expects at the current write position --
-    * see virgl_encode.c's virgl_encoder_emit_resource(). */
-   buf->buf[buf->cdw++] = res->handle;
+    * the EXECBUFFER ioctl) there's no side list to maintain here -- but
+    * `write_buffer` still must be honored. Most callers (virgl_context.c's
+    * state setters, virgl_query.c, virgl_streamout.c) pass `false` purely to
+    * mark a resource referenced, with no handle dword expected at the
+    * current write position at all; only virgl_encoder_emit_resource() (and
+    * the couple of direct transfer/blit call sites) pass `true` expecting
+    * the handle dword Mesa's command encoder needs written inline -- see
+    * virgl_encode.c's virgl_encoder_emit_resource(). Writing the dword
+    * unconditionally (as this used to) silently injected an extra dword
+    * into the encoded command stream at every `false` call site, desyncing
+    * every subsequent command's length-prefixed framing -- this is what was
+    * causing real virglrenderer to reject later commands (e.g.
+    * SET_VIEWPORT_STATE) as an "illegal command buffer". */
+   if (write_buffer)
+      buf->buf[buf->cdw++] = res->handle;
 }
 
 static int
@@ -327,6 +338,30 @@ virgl_etos_get_caps(UNUSED struct virgl_winsys *vws, struct virgl_drm_caps *caps
                               &written) != 0)
       return -1;
 
+   /* The host legitimately advertises VIRGL_CAP_V2_COPY_TRANSFER_BOTH_DIRECTIONS
+    * (real virglrenderer feature), which makes virgl_can_use_staging() (see
+    * virgl_resource.c) set `res->use_staging` on our resources -- causing
+    * texture readback (glReadPixels) to go through
+    * virgl_encode_copy_transfer()'s in-command-stream COPY_TRANSFER3D
+    * instead of our own transfer_get/transfer_put. That path assumes the
+    * *same* memory a winsys's resource_map() returns is what the host
+    * writes into when it processes the embedded copy -- true for the DRM
+    * winsys (one dma-buf/GEM handle, mapped and attached-as-backing are the
+    * same pages), but not for us: `GpuContext.Bind()` gives a *bound*
+    * resource its own internal, driver-owned scratch DmaAllocation as the
+    * attached backing (see drivers/virtio-gpud/src/gpu_context.rs's module
+    * doc), separate from the caller's own mappable `BufferCap` --
+    * `etos_virgl_resource_map()` maps the latter, not the former, so data
+    * the host writes via an embedded copy transfer never reaches it. Only
+    * our explicit `TransferToHost`/`TransferFromHost` RPCs bridge the two
+    * (via `BufferCap::copy_to_sync`/`copy_from_sync`). Clearing this bit
+    * keeps Mesa on the VIRGL_TRANSFER_MAP_HW_RES / explicit transfer_get
+    * path, which we do implement correctly. Found via real-hardware
+    * testing: glReadPixels came back as a mostly-black image with a thin
+    * strip of noise -- the staging buffer's host-written contents never
+    * reached the buffer glReadPixels actually read from. */
+   caps->caps.v2.capability_bits_v2 &= ~VIRGL_CAP_V2_COPY_TRANSFER_BOTH_DIRECTIONS;
+
    return 0;
 }
 
@@ -397,6 +432,39 @@ virgl_etos_create_screen(const struct pipe_screen_config *config)
       return NULL;
 
    vws->supports_fences = etos_virgl_supports_fences();
+   /* "Encoded transfers" means a VIRGL_CCMD_TRANSFER3D command embedded
+    * directly in the submitted command stream (virgl_transfer_queue.c's
+    * `transfer_write`, gated on this flag via `virgl_transfer_queue_init`'s
+    * `queue->tbuf`) instead of a separate `vws->transfer_put` call. Unlike
+    * `submit_cmd` (which really does just forward opaque bytes verbatim),
+    * this command still tells the *host* to read the transferred bytes out
+    * of the resource's already-attached guest backing memory -- it carries
+    * no inline payload. That's exactly what `GpuContext.TransferToHost`
+    * (via `vws->transfer_put`) already does correctly for us (copying the
+    * caller's `BufferCap` data into this driver's internal, actually-attached
+    * scratch `DmaAllocation` first -- see `drivers/virtio-gpud/src/
+    * gpu_context.rs`'s module doc on why that hop exists). An *encoded*
+    * transfer skips that hop entirely, so the caller's write never reaches
+    * the attached backing at all: real-hardware testing showed vertex/
+    * uniform buffer uploads silently no-op'ing this way (a submitted
+    * triangle rendered as nothing -- correct clear color, zero geometry,
+    * no error anywhere) once this flag was set to `1` to fix a *different*
+    * bug (see below). Keeping it `0` keeps every write going through
+    * `vws->transfer_put`, which we do implement correctly.
+    *
+    * This flag also happened to be the (wrong) fix for an earlier crash:
+    * setting it to `1` made `vctx->supports_staging` true (virgl_context.c's
+    * `virgl_context_create`, gated on `supports_encoded_transfers &&
+    * VIRGL_CAP_TRANSFER`), which was needed for `virgl_staging_init` to run
+    * before `res->use_staging` (gated on a *different*, host-capset-only bit,
+    * `VIRGL_CAP_V2_COPY_TRANSFER_BOTH_DIRECTIONS`) could pick the
+    * staging-read path and dereference the otherwise-never-initialized
+    * `vctx->staging.vws` (NULL) -- crashing at `NULL +
+    * offsetof(struct virgl_winsys, resource_reference)` (0x38). The real fix
+    * for *that* bug is below (`virgl_etos_get_caps` masks off
+    * `VIRGL_CAP_V2_COPY_TRANSFER_BOTH_DIRECTIONS` so `res->use_staging` is
+    * never true in the first place), which made this flag's `1` not just
+    * unnecessary but actively wrong. */
    vws->supports_encoded_transfers = 0;
    vws->supports_coherent = 0;
 
