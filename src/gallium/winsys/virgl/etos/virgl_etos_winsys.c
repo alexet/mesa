@@ -7,11 +7,15 @@
  * (etos_virgl_*), instead of DRM ioctls (../drm) or the vtest socket
  * protocol (../vtest). See utility/virgl-glue/src/lib.rs's module doc for
  * the design this mirrors: no resource caching (every resource_create
- * allocates fresh), and no real fence objects -- every op that would
- * return a fence already blocks until the real virtio-gpu round-trip
- * completes on the etos side (drivers/virtio-gpud's fences are synchronous
- * throughout), so any non-NULL `struct pipe_fence_handle *` here is treated
- * as already-signaled.
+ * allocates fresh), but real fence objects now -- GpuContext.Submit/
+ * TransferToHost/TransferFromHost are genuinely asynchronous on the etos
+ * side (drivers/virtio-gpud/src/fence.rs), so `struct pipe_fence_handle *`
+ * here really is a live handle into utility/virgl-glue's FENCES table, not
+ * a sentinel. It's encoded/decoded via virgl_etos_fence_encode/decode
+ * below (a +1 offset) rather than the raw uint32_t slot, since slot 0 is a
+ * legitimate real fence handle (the registry's id allocator starts at 0)
+ * but Gallium uses a NULL `pipe_fence_handle *` to mean "no fence" -- the
+ * two must not collide.
  *
  * struct virgl_hw_res is winsys-private -- confirmed against every real
  * user in src/gallium/drivers/virgl (virgl_context.c, virgl_resource.c,
@@ -21,6 +25,7 @@
  * what this file itself uses, not the drm winsys's full layout.
  */
 
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -54,8 +59,12 @@ extern int etos_virgl_transfer_to_host(uint32_t handle, uint32_t x, uint32_t y, 
 extern int etos_virgl_transfer_from_host(uint32_t handle, uint32_t x, uint32_t y, uint32_t z,
                                           uint32_t w, uint32_t h, uint32_t d, uint32_t level,
                                           uint32_t stride, uint32_t layer_stride, uint64_t offset);
-extern int etos_virgl_submit(const uint8_t *commands, size_t len);
+extern int etos_virgl_submit(const uint8_t *commands, size_t len, uint32_t *out_fence);
 extern int etos_virgl_wait_idle(void);
+extern int etos_virgl_fence_wait(uint32_t handle, uint64_t timeout_ns);
+extern uint32_t etos_virgl_fence_clone(uint32_t handle);
+extern void etos_virgl_fence_destroy(uint32_t handle);
+extern bool etos_virgl_last_pending(void);
 
 /* Real virtio-gpu wire structs cap `virtio_gpu_ctx_create.debug_name` at 64
  * bytes and this is purely a host-side debug label -- see
@@ -69,6 +78,22 @@ struct virgl_hw_res {
    uint64_t size;
    void *ptr; /* NULL until first resource_map */
 };
+
+/* `pipe_fence_handle *` <-> utility/virgl-glue's FENCES slot, offset by one
+ * so real slot 0 never collides with Gallium's own NULL-means-no-fence
+ * convention -- see this file's header. `decode` must not be called on
+ * NULL (every call site below checks first). */
+static inline struct pipe_fence_handle *
+virgl_etos_fence_encode(uint32_t handle)
+{
+   return (struct pipe_fence_handle *)(uintptr_t)((uint64_t)handle + 1);
+}
+
+static inline uint32_t
+virgl_etos_fence_decode(struct pipe_fence_handle *fence)
+{
+   return (uint32_t)((uintptr_t)fence - 1);
+}
 
 static inline uint32_t
 virgl_etos_image_type(enum pipe_texture_target target)
@@ -148,15 +173,19 @@ virgl_etos_resource_map(UNUSED struct virgl_winsys *vws, struct virgl_hw_res *re
 static void
 virgl_etos_resource_wait(UNUSED struct virgl_winsys *vws, UNUSED struct virgl_hw_res *res)
 {
-   /* Every op that could leave `res` busy (transfer_put/get, submit_cmd)
-    * already blocked until the real virtio-gpu round-trip completed -- see
-    * this file's header. */
+   /* Can't wait on this *specific* resource without per-resource
+    * dependency tracking this bridge doesn't do, so conservatively wait
+    * for the whole context to go idle instead -- sound, just coarser than
+    * strictly necessary. */
+   etos_virgl_wait_idle();
 }
 
 static bool
 virgl_etos_resource_is_busy(UNUSED struct virgl_winsys *vws, UNUSED struct virgl_hw_res *res)
 {
-   return false;
+   /* Same "some submission or transfer is outstanding somewhere" coarseness
+    * as res_is_referenced below. */
+   return etos_virgl_last_pending();
 }
 
 static struct virgl_hw_res *
@@ -272,12 +301,14 @@ static int
 virgl_etos_submit_cmd(UNUSED struct virgl_winsys *vws, struct virgl_cmd_buf *buf,
                        struct pipe_fence_handle **fence)
 {
-   int ret = etos_virgl_submit((const uint8_t *)buf->buf, (size_t)buf->cdw * sizeof(uint32_t));
+   uint32_t handle = 0;
+   int ret = etos_virgl_submit((const uint8_t *)buf->buf, (size_t)buf->cdw * sizeof(uint32_t),
+                                fence ? &handle : NULL);
    buf->cdw = 0;
    if (ret != 0)
       return ret;
    if (fence)
-      *fence = (struct pipe_fence_handle *)(uintptr_t)1; /* already-signaled sentinel */
+      *fence = virgl_etos_fence_encode(handle);
    return 0;
 }
 
@@ -285,11 +316,15 @@ static bool
 virgl_etos_res_is_referenced(UNUSED struct virgl_winsys *vws, UNUSED struct virgl_cmd_buf *buf,
                               UNUSED struct virgl_hw_res *res)
 {
-   /* Safe to always report "not referenced": submit_cmd already blocks
-    * until the GPU has finished with everything in `buf` before returning
-    * (see this file's header), so there is never a submission still
-    * outstanding by the time a caller could ask this question. */
-   return false;
+   /* Coarse but sound: "some submission is still outstanding somewhere",
+    * not "this specific resource is referenced by it" -- this bridge never
+    * parses command buffers to know which resources a given submission
+    * actually touches. Over-reporting `true` only costs Mesa an extra
+    * staging allocation it didn't strictly need; under-reporting `false`
+    * while the GPU is still reading/writing `res` (now a real possibility
+    * once submit_cmd stopped blocking) would let Mesa overwrite live
+    * storage. */
+   return etos_virgl_last_pending();
 }
 
 /* VIRTIO_GPU_CAPSET_VIRGL / _VIRGL2 (virtio_gpu.h): GET_CAPSET_INFO's
@@ -368,23 +403,43 @@ virgl_etos_get_caps(UNUSED struct virgl_winsys *vws, struct virgl_drm_caps *caps
 static struct pipe_fence_handle *
 virgl_etos_cs_create_fence(UNUSED struct virgl_winsys *vws, UNUSED int fd)
 {
-   /* No external sync-fd import support -- see this file's header on why
-    * fences are a trivial always-signaled sentinel here. */
+   /* No external sync-fd import support -- no fd-passing virtio-gpu
+    * feature is negotiated, so there is nothing to import from. Real
+    * fences otherwise work now -- see this file's header. */
    return NULL;
 }
 
 static bool
-virgl_etos_fence_wait(UNUSED struct virgl_winsys *vws, UNUSED struct pipe_fence_handle *fence,
-                       UNUSED uint64_t timeout)
+virgl_etos_fence_wait(UNUSED struct virgl_winsys *vws, struct pipe_fence_handle *fence,
+                       uint64_t timeout)
 {
-   return true;
+   /* Gallium's `timeout` is nanoseconds, PIPE_TIMEOUT_INFINITE ==
+    * UINT64_MAX -- matches Fence.Wait's own timeout_ns/u64::MAX sentinel
+    * exactly (idl/fence.idl), no translation needed. */
+   if (!fence)
+      return true; /* NULL: nothing to wait for */
+   return etos_virgl_fence_wait(virgl_etos_fence_decode(fence), timeout) == 0;
 }
 
 static void
 virgl_etos_fence_reference(UNUSED struct virgl_winsys *vws, struct pipe_fence_handle **dst,
                             struct pipe_fence_handle *src)
 {
-   *dst = src;
+   /* Mints an independently-owning clone (etos_virgl_fence_clone) rather
+    * than a manual refcount bump -- etos capabilities don't have one to
+    * bump. Destroys the old handle unconditionally first: even a
+    * self-assignment (fence_reference(&x, x)) still ends up correct this
+    * way (destroy, then clone a fresh handle), just not as cheap as a true
+    * refcount's short-circuit. */
+   if (*dst)
+      etos_virgl_fence_destroy(virgl_etos_fence_decode(*dst));
+
+   if (!src) {
+      *dst = NULL;
+      return;
+   }
+   uint32_t cloned = etos_virgl_fence_clone(virgl_etos_fence_decode(src));
+   *dst = (cloned == UINT32_MAX) ? NULL : virgl_etos_fence_encode(cloned);
 }
 
 static void
