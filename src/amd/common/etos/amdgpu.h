@@ -150,6 +150,17 @@ struct amdgpu_gpu_info {
 };
 
 /*
+ * `extern "C"` because these are the only *functions* this header declares
+ * and it is included from C++ (radeonsi's amdgpu_bo.h chain). Everything
+ * else here is types, which need no linkage guard — but a mangled call to a
+ * C definition is a link error at the very end of the build, naming a
+ * demangled symbol that looks like it should exist.
+ */
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/*
  * The one libdrm function declared here rather than omitted, because the
  * etos backend genuinely implements it (ac_drm_etos.c) rather than
  * compiling the call out: `amdgpu_bo.h` reads a reservation's base address
@@ -162,5 +173,9 @@ uint64_t amdgpu_va_get_start_addr(amdgpu_va_handle va);
  * reservation through libdrm's name directly (amdgpu_bo.c), not through
  * ac_drm_va_range_free. */
 int amdgpu_va_range_free(amdgpu_va_handle va_range_handle);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* _ETOS_AMDGPU_H_ */

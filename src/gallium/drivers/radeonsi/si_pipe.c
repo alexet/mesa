@@ -260,8 +260,22 @@ static struct pipe_screen *radeonsi_screen_create_impl(struct radeon_winsys *ws,
 struct pipe_screen *radeonsi_screen_create(int fd, const struct pipe_screen_config *config)
 {
    struct radeon_winsys *rw = NULL;
+#ifndef HAVE_ETOS_AMDGPU
    drmVersionPtr version;
+#endif
 
+#ifdef HAVE_ETOS_AMDGPU
+   /* etos: there is no DRM device node to ask, and no fd — the GPU is
+    * reached through an AmdgpuDevice capability (src/amd/common/etos). The
+    * two things this block learns from drmGetVersion are already settled
+    * here: the driver is always amdgpu (never radeon, never virtio_gpu, so
+    * there is no version_major to switch on), and its interface version is
+    * reported by ac_drm_device_initialize instead. */
+   driParseConfigFiles(config->options, config->options_info,
+                       &(driConfigFileParseParams) { .driverName = "radeonsi" });
+   rw = amdgpu_winsys_create(-1, config, radeonsi_screen_create_impl, false);
+   return rw ? rw->screen : NULL;
+#else
    version = drmGetVersion(fd);
    if (!version)
      return NULL;
@@ -299,4 +313,5 @@ struct pipe_screen *radeonsi_screen_create(int fd, const struct pipe_screen_conf
 
    drmFreeVersion(version);
    return rw ? rw->screen : NULL;
+#endif
 }

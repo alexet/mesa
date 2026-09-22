@@ -220,6 +220,13 @@ with_gallium_radeonsi = gallium_drivers.contains('radeonsi')
 # here with the other driver flags rather than down in the AMD section,
 # because checks well above that point consult it. See meson.options.
 with_etos_amdgpu = get_option('etos-amdgpu')
+if with_etos_amdgpu
+  # Project-wide, not per-target: the backend swap is visible in
+  # src/amd/common (which replaces ac_linux_drm.c), in radeonsi (whose
+  # screen-creation path has no DRM device node to query), and in the
+  # surfaceless screen hook below.
+  pre_args += ['-DHAVE_ETOS_AMDGPU', '-DGALLIUM_RADEONSI_ETOS']
+endif
 with_gallium_r300 = gallium_drivers.contains('r300')
 with_gallium_r600 = gallium_drivers.contains('r600')
 with_gallium_nouveau = gallium_drivers.contains('nouveau')

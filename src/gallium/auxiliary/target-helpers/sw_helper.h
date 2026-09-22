@@ -44,6 +44,16 @@
 #include "virgl/etos/virgl_etos_winsys.h"
 #endif
 
+/* etos + radeonsi: same situation as GALLIUM_VIRGL_ETOS above, one driver
+ * down. The surfaceless/swrast screen-creation path is the only one this
+ * build has (there is no DRI device loader and no device node to enumerate),
+ * so the real GPU driver has to be reachable from here. radeonsi opens the
+ * card through an AmdgpuDevice capability rather than an fd, hence the -1.
+ * See src/amd/common/etos/. */
+#ifdef GALLIUM_RADEONSI_ETOS
+#include "radeonsi/si_public.h"
+#endif
+
 static inline struct pipe_screen *
 sw_screen_create_named(struct sw_winsys *winsys, const struct pipe_screen_config *config, const char *driver)
 {
@@ -52,6 +62,11 @@ sw_screen_create_named(struct sw_winsys *winsys, const struct pipe_screen_config
 #if defined(GALLIUM_VIRGL_ETOS)
    if (screen == NULL && (strcmp(driver, "virgl-etos") == 0 || !driver[0]))
       screen = virgl_etos_create_screen(config);
+#endif
+
+#if defined(GALLIUM_RADEONSI_ETOS)
+   if (screen == NULL && (strcmp(driver, "radeonsi-etos") == 0 || !driver[0]))
+      screen = radeonsi_screen_create(-1, config);
 #endif
 
 #if defined(GALLIUM_LLVMPIPE)
