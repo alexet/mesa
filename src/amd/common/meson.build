@@ -217,6 +217,18 @@ if with_amdgpu_virtio
   link_with += libvdrm
 endif
 
+# etos: the third ac_drm_* backend, alongside libdrm and virtio. Its own
+# <amdgpu.h> stands in for libdrm's (types only — there is no libdrm on
+# etos), so this directory has to come first on the include path.
+if with_etos_amdgpu
+  c_args += ['-DHAVE_ETOS_AMDGPU']
+  amd_common_files += files(
+    'etos/ac_drm_etos.c',
+    'etos/ac_drm_etos.h',
+    'etos/amdgpu.h',
+  )
+endif
+
 if dep_elf.found()
   amd_common_files += files(
     'ac_rtld.c',

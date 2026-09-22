@@ -420,6 +420,22 @@ option(
 )
 
 option(
+  'etos-amdgpu',
+  type : 'boolean',
+  value : false,
+  description : 'Build the radeonsi gallium driver against the etos amdgpu ' +
+                'backend (src/amd/common/etos) instead of libdrm_amdgpu -- ' +
+                'a third ac_drm_* backend alongside the libdrm and virtio ' +
+                'ones, talking the etos AmdgpuDevice/AmdgpuSession ' +
+                'capability protocol (idl/amdgpu.idl) through ' +
+                'utility/amdgpu-glue. Also drops the configure-time ' +
+                'libdrm_amdgpu dependency radeonsi otherwise requires, ' +
+                'since on etos there is no libdrm and no DRM fd to ioctl. ' +
+                'A build variant selected at Meson-configure time, not a ' +
+                'runtime choice -- see tools/build-mesa-radeonsi.sh.'
+)
+
+option(
   'glvnd',
   type : 'feature',
   deprecated: {'true': 'enabled', 'false': 'disabled'},

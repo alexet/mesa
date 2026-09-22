@@ -1900,9 +1900,15 @@ _drm_amdgpu_ver = '2.4.133'
 _drm_intel_ver = '2.4.75'
 _drm_ver = '2.4.109'
 
+# etos: radeonsi's ac_drm_* calls go to src/amd/common/etos (a third backend
+# alongside libdrm and virtio), so there is no libdrm_amdgpu to depend on --
+# and no DRM fd to ioctl, since the etos side is a capability protocol. See
+# meson.options' 'etos-amdgpu'.
+with_etos_amdgpu = get_option('etos-amdgpu')
+
 _libdrm_checks = [
   ['intel', with_gallium_i915],
-  ['amdgpu', (with_amd_vk and not with_platform_windows) or with_gallium_radeonsi],
+  ['amdgpu', ((with_amd_vk and not with_platform_windows) or with_gallium_radeonsi) and not with_etos_amdgpu],
 ]
 
 # Loop over the enables versions and get the highest libdrm requirement for all
