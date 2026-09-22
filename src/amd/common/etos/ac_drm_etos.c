@@ -35,7 +35,17 @@ struct ac_drm_device {
    uint64_t va_start;
    uint64_t va_end;
    uint64_t va_next;
+   /* The 32-bit-addressable sub-window. Every allocation made with
+    * AMDGPU_VA_RANGE_32_BIT must share one high dword, because the hardware
+    * takes it once (COMPUTE_PGM_HI and friends) rather than per-address —
+    * `ac_cmdbuf.h` asserts exactly that. So a 4 GiB-aligned range is carved
+    * out up front and `address32_hi` reports its high half. */
+   uint64_t va32_base;
+   uint64_t va32_next;
+   uint64_t va32_end;
 };
+
+#define ETOS_VA32_SIZE (1ull << 32)
 
 static struct ac_drm_device etos_dev;
 
@@ -172,7 +182,20 @@ int ac_drm_device_initialize(int fd, bool is_virtio, uint32_t *major_version,
        * refuse to initialise. */
       return -ENODEV;
    }
-   etos_dev.va_next = etos_dev.va_start;
+   /* Carve the 32-bit window out first, 4 GiB-aligned, and start general
+    * allocations above it. Done here rather than lazily so `address32_hi`
+    * has an answer before the first allocation asks for one. */
+   etos_dev.va32_base =
+      (etos_dev.va_start + ETOS_VA32_SIZE - 1) & ~(ETOS_VA32_SIZE - 1);
+   etos_dev.va32_end = etos_dev.va32_base + ETOS_VA32_SIZE;
+   if (etos_dev.va32_end > etos_dev.va_end) {
+      /* A VM too small to hold a 4 GiB window at all. Not a configuration
+       * this port targets (GFX10 reports 256 TiB), and quietly continuing
+       * would hand out 32-bit addresses that do not share a high dword. */
+      return -ENODEV;
+   }
+   etos_dev.va32_next = etos_dev.va32_base;
+   etos_dev.va_next = etos_dev.va32_end;
 
    /* drm-kmod's KMS_DRIVER_{MAJOR,MINOR}. Mesa gates optional features on
     * the minor (`ac_gpu_info.c` requires >= 54, checks up to 60), so this
@@ -364,14 +387,24 @@ void ac_drm_query_has_vm_always_valid(ac_drm_device *dev, struct radeon_info *in
 
 int ac_drm_query_sw_info(ac_drm_device *dev, enum amdgpu_sw_info info, void *value)
 {
-   /* libdrm answers `address32_hi` from state it keeps itself. The winsys
-    * places 32-bit-addressable allocations with it, so a wrong value puts
-    * them where the GPU cannot reach — which looks like corruption, not a
-    * failed query. Unsupported until there is a real answer. */
-   (void)dev;
-   (void)info;
-   (void)value;
-   return -ENOTSUP;
+   /* Answered from this backend's own VA bookkeeping, exactly as libdrm
+    * answers it from its own — there is no kernel query behind this. */
+   if (!dev || !value)
+      return -EINVAL;
+
+   switch (info) {
+   case amdgpu_sw_info_address32_hi:
+      /* The high dword every AMDGPU_VA_RANGE_32_BIT allocation shares. */
+      *(uint32_t *)value = (uint32_t)(dev->va32_base >> 32);
+      return 0;
+   case amdgpu_sw_info_address_prt_wa_control_bit:
+      /* A per-ASIC workaround bit for partially-resident textures. Sparse
+       * residency is not offered here, so there is nothing to work around. */
+      *(uint32_t *)value = 0;
+      return 0;
+   default:
+      return -EINVAL;
+   }
 }
 
 int ac_drm_query_sensor_info(ac_drm_device *dev, unsigned sensor_type, unsigned size, void *value)
@@ -625,22 +658,27 @@ int ac_drm_va_range_alloc(ac_drm_device *dev, enum amdgpu_gpu_va_range va_range_
 {
    struct amdgpu_va *va;
    uint64_t base;
-
-   (void)flags;
    if (!dev || !va_base_allocated || !va_range_handle || size == 0)
       return -EINVAL;
    if (va_range_type != amdgpu_gpu_va_range_general)
       return -ENOTSUP;
 
    /* Bump allocation, never reused. libdrm keeps a real free-list here; this
-    * does not, and the window is 256 TiB wide (`virtual_address_max`), so a
-    * process would have to churn an implausible number of allocations to
-    * exhaust it. Worth revisiting if a long-running compositor ever does. */
-   base = va_base_required ? va_base_required : etos_dev.va_next;
+    * does not, and the general window is most of a 256 TiB address space
+    * (`virtual_address_max`), so a process would have to churn an
+    * implausible number of allocations to exhaust it. Worth revisiting if a
+    * long-running compositor ever does — and note the 32-bit window below is
+    * only 4 GiB, so it is the one that would run out first. */
+   bool want32 = (flags & AMDGPU_VA_RANGE_32_BIT) != 0;
+   uint64_t *next = want32 ? &etos_dev.va32_next : &etos_dev.va_next;
+   uint64_t lo = want32 ? etos_dev.va32_base : etos_dev.va_start;
+   uint64_t hi = want32 ? etos_dev.va32_end : etos_dev.va_end;
+
+   base = va_base_required ? va_base_required : *next;
    if (va_base_alignment > 1)
       base = (base + va_base_alignment - 1) & ~(va_base_alignment - 1);
 
-   if (base < etos_dev.va_start || base + size > etos_dev.va_end)
+   if (base < lo || base + size > hi)
       return -ENOMEM;
 
    va = calloc(1, sizeof(*va));
@@ -650,7 +688,7 @@ int ac_drm_va_range_alloc(ac_drm_device *dev, enum amdgpu_gpu_va_range va_range_
    va->size = size;
 
    if (!va_base_required)
-      etos_dev.va_next = base + size;
+      *next = base + size;
 
    *va_base_allocated = base;
    *va_range_handle = va;
