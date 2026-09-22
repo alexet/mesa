@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "util/os_time.h"
 #include "util/u_sync_provider.h"
 
 /*
@@ -60,15 +61,20 @@ static int etos_query(uint32_t query, uint32_t arg0, uint32_t arg1, void *out,
 /* ── sync provider ───────────────────────────────────────────────────────
  *
  * radeonsi asks the device for one and uses it for every syncobj operation.
- * The protocol's syncobj methods report `Unsupported` today
- * (drivers/drmd/src/amdgpu/session.rs), so these do too — consistently,
- * rather than half-working. Explicit synchronisation is what needs them, and
- * that is a later milestone.
+ * These forward to the protocol's own syncobj methods, which are DRM's
+ * `drm_syncobj.c` handlers on the far side.
+ *
+ * The fd-shaped operations (handle_to_fd, fd_to_handle, import/export
+ * sync_file) stay unsupported: they exist to pass a sync object *between
+ * processes* as a file descriptor, and etos shares things as capabilities
+ * rather than fds. Bridging that properly is `SyncobjToFence` in
+ * idl/amdgpu.idl — a real capability, not an fd number — and nothing asks
+ * for it yet.
  */
-static int sync_enotsup_create(struct util_sync_provider *p, uint32_t flags, uint32_t *handle)
-{ (void)p; (void)flags; (void)handle; return -ENOTSUP; }
-static int sync_enotsup_destroy(struct util_sync_provider *p, uint32_t handle)
-{ (void)p; (void)handle; return -ENOTSUP; }
+static int sync_create(struct util_sync_provider *p, uint32_t flags, uint32_t *handle)
+{ (void)p; return etos_amdgpu_syncobj_create(flags, handle) ? -EINVAL : 0; }
+static int sync_destroy(struct util_sync_provider *p, uint32_t handle)
+{ (void)p; return etos_amdgpu_syncobj_destroy(handle) ? -EINVAL : 0; }
 static int sync_enotsup_handle_to_fd(struct util_sync_provider *p, uint32_t handle, int *fd)
 { (void)p; (void)handle; (void)fd; return -ENOTSUP; }
 static int sync_enotsup_fd_to_handle(struct util_sync_provider *p, int fd, uint32_t *handle)
@@ -77,13 +83,28 @@ static int sync_enotsup_import_sync_file(struct util_sync_provider *p, uint32_t 
 { (void)p; (void)h; (void)fd; return -ENOTSUP; }
 static int sync_enotsup_export_sync_file(struct util_sync_provider *p, uint32_t h, int *fd)
 { (void)p; (void)h; (void)fd; return -ENOTSUP; }
-static int sync_enotsup_wait(struct util_sync_provider *p, uint32_t *handles, unsigned n,
-                             int64_t timeout, unsigned flags, uint32_t *first)
-{ (void)p; (void)handles; (void)n; (void)timeout; (void)flags; (void)first; return -ENOTSUP; }
-static int sync_enotsup_reset(struct util_sync_provider *p, const uint32_t *handles, uint32_t n)
-{ (void)p; (void)handles; (void)n; return -ENOTSUP; }
-static int sync_enotsup_signal(struct util_sync_provider *p, const uint32_t *handles, uint32_t n)
-{ (void)p; (void)handles; (void)n; return -ENOTSUP; }
+/* Mesa's timeout is an absolute deadline in nanoseconds; the protocol takes
+ * a duration, so the far side can convert against its own clock rather than
+ * this one having to agree with it. A deadline in the past is a poll. */
+static uint64_t sync_timeout_to_duration(int64_t timeout_nsec)
+{
+   int64_t now = (int64_t)os_time_get_nano();
+   return timeout_nsec > now ? (uint64_t)(timeout_nsec - now) : 0;
+}
+
+static int sync_wait(struct util_sync_provider *p, uint32_t *handles, unsigned n,
+                     int64_t timeout, unsigned flags, uint32_t *first)
+{
+   (void)p;
+   return etos_amdgpu_syncobj_wait(handles, n, sync_timeout_to_duration(timeout), flags,
+                                   first)
+             ? -EINVAL
+             : 0;
+}
+static int sync_reset(struct util_sync_provider *p, const uint32_t *handles, uint32_t n)
+{ (void)p; return etos_amdgpu_syncobj_reset(handles, n) ? -EINVAL : 0; }
+static int sync_signal(struct util_sync_provider *p, const uint32_t *handles, uint32_t n)
+{ (void)p; return etos_amdgpu_syncobj_signal(handles, n) ? -EINVAL : 0; }
 static int sync_enotsup_timeline_signal(struct util_sync_provider *p, const uint32_t *handles,
                                         uint64_t *points, uint32_t n)
 { (void)p; (void)handles; (void)points; (void)n; return -ENOTSUP; }
@@ -92,30 +113,30 @@ static int sync_enotsup_timeline_wait(struct util_sync_provider *p, uint32_t *ha
                                       unsigned flags, uint32_t *first)
 { (void)p; (void)handles; (void)points; (void)n; (void)timeout; (void)flags; (void)first;
   return -ENOTSUP; }
-static int sync_enotsup_query(struct util_sync_provider *p, uint32_t *handles, uint64_t *points,
-                              uint32_t n, uint32_t flags)
-{ (void)p; (void)handles; (void)points; (void)n; (void)flags; return -ENOTSUP; }
-static int sync_enotsup_transfer(struct util_sync_provider *p, uint32_t dh, uint64_t dp,
-                                 uint32_t sh, uint64_t sp, uint32_t flags)
-{ (void)p; (void)dh; (void)dp; (void)sh; (void)sp; (void)flags; return -ENOTSUP; }
+static int sync_query(struct util_sync_provider *p, uint32_t *handles, uint64_t *points,
+                      uint32_t n, uint32_t flags)
+{ (void)p; (void)flags; return etos_amdgpu_syncobj_query(handles, n, points) ? -EINVAL : 0; }
+static int sync_transfer(struct util_sync_provider *p, uint32_t dh, uint64_t dp,
+                         uint32_t sh, uint64_t sp, uint32_t flags)
+{ (void)p; return etos_amdgpu_syncobj_transfer(dh, dp, sh, sp, flags) ? -EINVAL : 0; }
 static void sync_noop_finalize(struct util_sync_provider *p) { (void)p; }
 static struct util_sync_provider *sync_clone(struct util_sync_provider *p) { return p; }
 
 static void etos_sync_init(struct util_sync_provider *p)
 {
-   p->create = sync_enotsup_create;
-   p->destroy = sync_enotsup_destroy;
+   p->create = sync_create;
+   p->destroy = sync_destroy;
    p->handle_to_fd = sync_enotsup_handle_to_fd;
    p->fd_to_handle = sync_enotsup_fd_to_handle;
    p->import_sync_file = sync_enotsup_import_sync_file;
    p->export_sync_file = sync_enotsup_export_sync_file;
-   p->wait = sync_enotsup_wait;
-   p->reset = sync_enotsup_reset;
-   p->signal = sync_enotsup_signal;
+   p->wait = sync_wait;
+   p->reset = sync_reset;
+   p->signal = sync_signal;
    p->timeline_signal = sync_enotsup_timeline_signal;
    p->timeline_wait = sync_enotsup_timeline_wait;
-   p->query = sync_enotsup_query;
-   p->transfer = sync_enotsup_transfer;
+   p->query = sync_query;
+   p->transfer = sync_transfer;
    p->finalize = sync_noop_finalize;
    p->clone = sync_clone;
 }
@@ -759,16 +780,65 @@ void ac_drm_cs_chunk_fence_info_to_data(uint32_t bo_handle_in, uint64_t offset,
  * because the winsys would build dependency chains nothing enforces.
  */
 int ac_drm_cs_create_syncobj2(ac_drm_device *dev, uint32_t flags, uint32_t *handle)
-{ (void)dev; (void)flags; (void)handle; return -ENOTSUP; }
+{
+   (void)dev;
+   if (!handle)
+      return -EINVAL;
+   return etos_amdgpu_syncobj_create(flags, handle) ? -EINVAL : 0;
+}
+
 int ac_drm_cs_destroy_syncobj(ac_drm_device *dev, uint32_t handle)
-{ (void)dev; (void)handle; return -ENOTSUP; }
+{
+   (void)dev;
+   return etos_amdgpu_syncobj_destroy(handle) ? -EINVAL : 0;
+}
+
 int ac_drm_cs_syncobj_wait(ac_drm_device *dev, uint32_t *handles, unsigned num_handles,
                            int64_t timeout_nsec, unsigned flags, uint32_t *first_signaled)
-{ (void)dev; (void)handles; (void)num_handles; (void)timeout_nsec; (void)flags;
-  (void)first_signaled; return -ENOTSUP; }
+{
+   (void)dev;
+   return etos_amdgpu_syncobj_wait(handles, num_handles,
+                                   sync_timeout_to_duration(timeout_nsec), flags,
+                                   first_signaled)
+             ? -EINVAL
+             : 0;
+}
+
 int ac_drm_cs_syncobj_query2(ac_drm_device *dev, uint32_t *handles, uint64_t *points,
                              unsigned num_handles, uint32_t flags)
-{ (void)dev; (void)handles; (void)points; (void)num_handles; (void)flags; return -ENOTSUP; }
+{
+   (void)dev;
+   (void)flags;
+   return etos_amdgpu_syncobj_query(handles, num_handles, points) ? -EINVAL : 0;
+}
+
+int ac_drm_cs_syncobj_transfer(ac_drm_device *dev, uint32_t dst_handle, uint64_t dst_point,
+                               uint32_t src_handle, uint64_t src_point, uint32_t flags)
+{
+   (void)dev;
+   return etos_amdgpu_syncobj_transfer(dst_handle, dst_point, src_handle, src_point, flags)
+             ? -EINVAL
+             : 0;
+}
+
+int ac_drm_cs_syncobj_timeline_wait(ac_drm_device *dev, uint32_t *handles, uint64_t *points,
+                                    unsigned num_handles, int64_t timeout_nsec, unsigned flags,
+                                    uint32_t *first_signaled)
+{
+   /* Timeline waits need drm_syncobj_timeline_wait_ioctl, which takes the
+    * per-handle points array the binary wait has no room for. The protocol
+    * carries only the binary form today; adding it is a method, not a
+    * redesign. Unsupported rather than silently waiting on the wrong thing:
+    * treating a timeline wait as binary would return as soon as the object
+    * had *any* value, not the one asked for. */
+   (void)dev; (void)handles; (void)points; (void)num_handles; (void)timeout_nsec;
+   (void)flags; (void)first_signaled;
+   return -ENOTSUP;
+}
+
+/* The fd-shaped operations. These exist to pass a sync object between
+ * processes as a file descriptor; etos shares capabilities instead, and
+ * idl/amdgpu.idl's SyncobjToFence is the bridge when something needs one. */
 int ac_drm_cs_import_syncobj(ac_drm_device *dev, int shared_fd, uint32_t *handle)
 { (void)dev; (void)shared_fd; (void)handle; return -ENOTSUP; }
 int ac_drm_cs_syncobj_export_sync_file(ac_drm_device *dev, uint32_t syncobj, int *sync_file_fd)
@@ -778,15 +848,6 @@ int ac_drm_cs_syncobj_import_sync_file(ac_drm_device *dev, uint32_t syncobj, int
 int ac_drm_cs_syncobj_export_sync_file2(ac_drm_device *dev, uint32_t syncobj, uint64_t point,
                                         uint32_t flags, int *sync_file_fd)
 { (void)dev; (void)syncobj; (void)point; (void)flags; (void)sync_file_fd; return -ENOTSUP; }
-int ac_drm_cs_syncobj_transfer(ac_drm_device *dev, uint32_t dst_handle, uint64_t dst_point,
-                               uint32_t src_handle, uint64_t src_point, uint32_t flags)
-{ (void)dev; (void)dst_handle; (void)dst_point; (void)src_handle; (void)src_point; (void)flags;
-  return -ENOTSUP; }
-int ac_drm_cs_syncobj_timeline_wait(ac_drm_device *dev, uint32_t *handles, uint64_t *points,
-                                    unsigned num_handles, int64_t timeout_nsec, unsigned flags,
-                                    uint32_t *first_signaled)
-{ (void)dev; (void)handles; (void)points; (void)num_handles; (void)timeout_nsec; (void)flags;
-  (void)first_signaled; return -ENOTSUP; }
 
 /* ── user queues ─────────────────────────────────────────────────────────
  *

@@ -57,6 +57,17 @@ int   etos_amdgpu_submit(uint32_t ctx_id, const uint8_t *payload,
 int   etos_amdgpu_wait_cs(uint32_t ctx_id, uint32_t ip, uint32_t ip_instance,
                           uint32_t ring, uint64_t seq_no, uint64_t timeout_ns,
                           uint32_t *signalled);
+int   etos_amdgpu_syncobj_create(uint32_t flags, uint32_t *out_handle);
+int   etos_amdgpu_syncobj_destroy(uint32_t handle);
+int   etos_amdgpu_syncobj_wait(const uint32_t *handles, uint32_t count,
+                               uint64_t timeout_ns, uint32_t flags,
+                               uint32_t *first_signalled);
+int   etos_amdgpu_syncobj_reset(const uint32_t *handles, uint32_t count);
+int   etos_amdgpu_syncobj_signal(const uint32_t *handles, uint32_t count);
+int   etos_amdgpu_syncobj_transfer(uint32_t dst, uint64_t dst_point, uint32_t src,
+                                   uint64_t src_point, uint32_t flags);
+int   etos_amdgpu_syncobj_query(const uint32_t *handles, uint32_t count,
+                                uint64_t *out_points);
 
 /* The `ac_drm_*` API this file implements is declared by
  * `ac_linux_drm.h`, not here — that is the whole point of replacing
