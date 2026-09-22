@@ -593,10 +593,21 @@ int ac_drm_va_range_alloc(ac_drm_device *dev, enum amdgpu_gpu_va_range va_range_
    return 0;
 }
 
+uint64_t amdgpu_va_get_start_addr(amdgpu_va_handle va)
+{
+   return va ? va->base : 0;
+}
+
 int ac_drm_va_range_free(amdgpu_va_handle va_range_handle)
 {
    free(va_range_handle);
    return 0;
+}
+
+/* The winsys calls libdrm's name for this directly. Same operation. */
+int amdgpu_va_range_free(amdgpu_va_handle va_range_handle)
+{
+   return ac_drm_va_range_free(va_range_handle);
 }
 
 int ac_drm_va_range_query(ac_drm_device *dev, enum amdgpu_gpu_va_range type, uint64_t *start,

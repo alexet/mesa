@@ -82,7 +82,14 @@ files_libradeonsi = files(
 )
 
 radeonsi_include_dirs = [inc_src, inc_include, inc_gallium, inc_gallium_aux, inc_amd_common,
-                         inc_gallium_drivers, inc_compiler, inc_amd, inc_amd_vpe, inc_virtio_gpu]
+                         inc_gallium_drivers, inc_compiler, inc_amd, inc_amd_vpe, inc_virtio_gpu,
+                         # si_fence.c's unconditional `#include <libsync.h>`
+                         # needs src/util/ itself on the path -- inc_util only
+                         # exposes src/ (its parent), which resolves
+                         # `<util/libsync.h>` but not the bare form this file
+                         # writes. Same fix, and same reason, as
+                         # src/gallium/drivers/virgl/meson.build's.
+                         include_directories('../../../util')]
 radeonsi_deps = [dep_clock, dep_libdrm, idep_nir_headers, idep_amd_generated_headers,
                  idep_mesautil, idep_u_tracepoints, idep_si_tracepoints]
 

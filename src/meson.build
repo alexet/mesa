@@ -16,15 +16,6 @@ inc_src = include_directories('.')
 inc_gallium = include_directories('gallium/include')
 inc_gallium_aux = include_directories('gallium/auxiliary')
 inc_amd_common = include_directories('amd/common', 'amd/common/nir')
-# etos: amd/common/etos carries a stand-in <amdgpu.h> (libdrm's types only;
-# there is no libdrm on etos), which `ac_linux_drm.h` includes by that name.
-# Added after the others so it is only ever found when nothing else provides
-# it -- on a host with real libdrm this directory is simply not on the path,
-# because `with_etos_amdgpu` is false.
-if get_option('etos-amdgpu')
-  inc_amd_common = include_directories('amd/common', 'amd/common/nir',
-                                       'amd/common/etos')
-endif
 inc_tool = include_directories('tool')
 inc_virtio = include_directories('virtio')
 inc_virtio_gpu = include_directories('virtio/virtio-gpu')

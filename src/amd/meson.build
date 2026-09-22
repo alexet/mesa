@@ -2,6 +2,13 @@
 # SPDX-License-Identifier: MIT
 
 inc_amd = include_directories('.')
+# etos: common/etos carries a stand-in <amdgpu.h> (libdrm's types only --
+# there is no libdrm on etos), which ac_linux_drm.h includes by that name.
+# Added to inc_amd rather than to one target's own list because every AMD
+# target that includes that header needs it.
+if get_option('etos-amdgpu')
+  inc_amd = include_directories('.', 'common/etos')
+endif
 
 if with_tools.contains('drm-shim')
   subdir('drm-shim')

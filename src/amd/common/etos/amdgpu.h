@@ -52,6 +52,13 @@ enum amdgpu_gpu_va_range {
    amdgpu_gpu_va_range_general = 0,
 };
 
+/* Flags for amdgpu_va_range_alloc. `32_BIT` asks for an address the GPU can
+ * reach with a 32-bit pointer; `HIGH` asks for the upper half of the range.
+ * Accepted and ignored by this backend's bump allocator — it hands out from
+ * one window, and amdgpu validates every address anyway. */
+#define AMDGPU_VA_RANGE_32_BIT 0x1
+#define AMDGPU_VA_RANGE_HIGH   0x2
+
 enum amdgpu_sw_info {
    amdgpu_sw_info_address32_hi = 0,
    amdgpu_sw_info_address_prt_wa_control_bit = 1,
@@ -76,9 +83,11 @@ struct amdgpu_bo_alloc_request {
 /* Tiling/metadata a BO carries for the display path. Not used by the etos
  * backend yet (`bo_set_metadata` reports unsupported), but named in
  * `ac_drm_*` signatures. */
+/* `tiling_info` is 64-bit in libdrm, and Mesa takes its address as a
+ * `uint64_t *` (amdgpu_bo.c's ac_surface_compute_bo_metadata call). */
 struct amdgpu_bo_metadata {
    uint64_t flags;
-   uint32_t tiling_info;
+   uint64_t tiling_info;
    uint32_t size_metadata;
    uint32_t umd_metadata[64];
 };
@@ -139,5 +148,19 @@ struct amdgpu_gpu_info {
    uint32_t vce_harvest_config;
    uint32_t pci_rev_id;
 };
+
+/*
+ * The one libdrm function declared here rather than omitted, because the
+ * etos backend genuinely implements it (ac_drm_etos.c) rather than
+ * compiling the call out: `amdgpu_bo.h` reads a reservation's base address
+ * through it from an inline, so there is no `#ifdef` to hide behind. Pure
+ * accessor over a handle this backend minted — no device involved.
+ */
+uint64_t amdgpu_va_get_start_addr(amdgpu_va_handle va);
+
+/* Likewise implemented rather than compiled out: the winsys frees a VA
+ * reservation through libdrm's name directly (amdgpu_bo.c), not through
+ * ac_drm_va_range_free. */
+int amdgpu_va_range_free(amdgpu_va_handle va_range_handle);
 
 #endif /* _ETOS_AMDGPU_H_ */

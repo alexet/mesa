@@ -214,6 +214,12 @@ endif
 with_amdgpu_virtio = get_option('amdgpu-virtio')
 
 with_gallium_radeonsi = gallium_drivers.contains('radeonsi')
+# etos: radeonsi's ac_drm_* calls go to src/amd/common/etos, which replaces
+# ac_linux_drm.c entirely -- so there is no libdrm_amdgpu to depend on, and
+# no DRM fd to ioctl, since the etos side is a capability protocol. Defined
+# here with the other driver flags rather than down in the AMD section,
+# because checks well above that point consult it. See meson.options.
+with_etos_amdgpu = get_option('etos-amdgpu')
 with_gallium_r300 = gallium_drivers.contains('r300')
 with_gallium_r600 = gallium_drivers.contains('r600')
 with_gallium_nouveau = gallium_drivers.contains('nouveau')
@@ -1571,7 +1577,17 @@ if cc.compiles('''#include <stdint.h>
                               (int)__atomic_add_fetch(x.v, (uint64_t)1, __ATOMIC_ACQ_REL);
                      }''',
                   name : 'GCC atomic builtins required -latomic')
-    dep_atomic = cc.find_library('atomic')
+    # etos: that link test cannot succeed here for reasons unrelated to
+    # atomics — clang's bare-metal target hands the link to the host gcc
+    # driver, which pulls in the host's Scrt1.o and fails on
+    # __libc_start_main. On x86-64 every atomic in that test is lock-free
+    # and no libatomic is needed, so requiring one would fail the configure
+    # over a question the test never actually asked.
+    if with_etos_amdgpu
+      warning('etos: ignoring the -latomic probe; x86-64 atomics are lock-free')
+    else
+      dep_atomic = cc.find_library('atomic')
+    endif
   endif
 endif
 if not cc.links('''#include <stdint.h>
@@ -1900,12 +1916,6 @@ _drm_amdgpu_ver = '2.4.133'
 _drm_intel_ver = '2.4.75'
 _drm_ver = '2.4.109'
 
-# etos: radeonsi's ac_drm_* calls go to src/amd/common/etos (a third backend
-# alongside libdrm and virtio), so there is no libdrm_amdgpu to depend on --
-# and no DRM fd to ioctl, since the etos side is a capability protocol. See
-# meson.options' 'etos-amdgpu'.
-with_etos_amdgpu = get_option('etos-amdgpu')
-
 _libdrm_checks = [
   ['intel', with_gallium_i915],
   ['amdgpu', ((with_amd_vk and not with_platform_windows) or with_gallium_radeonsi) and not with_etos_amdgpu],
@@ -2154,7 +2164,22 @@ dep_elf = dependency('libelf', required : false)
 if not with_platform_windows and not dep_elf.found()
   dep_elf = cc.find_library('elf', required : false)
 endif
-if dep_elf.found()
+# etos: tools/build-libelf.sh cross-builds elftoolchain's libelf into the
+# sysroot, but Meson cannot probe for it — there is no pkg-config for the
+# target, and `cc.find_library`'s link test falls back to the host toolchain
+# (clang's bare-metal target has no library search path of its own, so the
+# host's crt and libraries leak in and the result says nothing about the
+# sysroot). Named directly instead.
+#
+# Worth knowing *why* radeonsi needs it here at all: ac_rtld.c loads
+# LLVM-produced shader ELFs, and this build compiles shaders with ACO
+# (-Damd-use-llvm=false), which emits SI_SHADER_BINARY_RAW. So nothing ever
+# calls into libelf at run time — it is a link-time requirement for code
+# that is dead on this build.
+if with_etos_amdgpu and not dep_elf.found()
+  dep_elf = declare_dependency(link_args : ['-lelf'])
+  pre_args += '-DUSE_LIBELF'
+elif dep_elf.found()
   pre_args += '-DUSE_LIBELF'
 elif with_gallium_radeonsi and with_gfx_compute
   error('Gallium driver radeonsi requires libelf')
