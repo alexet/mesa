@@ -15,8 +15,10 @@
 
 #include "ac_drm_etos.h"
 #include "ac_linux_drm.h"
+#include "drm-uapi/drm.h"
 
 #include <errno.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -561,18 +563,59 @@ int ac_drm_bo_va_op_raw(ac_drm_device *dev, uint32_t bo_handle_in, uint64_t offs
    return 0;
 }
 
+/*
+ * The syncobj-carrying VA operation, emulated.
+ *
+ * Newer amdgpu UAPI lets a VA operation take input fences and signal an
+ * output timeline point, so the VM update can be queued and ordered against
+ * other work. The amdgpu this build runs (drm-kmod, KMS 3.59) has none of
+ * those fields in `drm_amdgpu_gem_va`, so the three steps are done here
+ * instead: wait the input fences, perform the mapping, signal the output
+ * timeline.
+ *
+ * That is only correct because `VaOp` is *synchronous* — the mapping is in
+ * the page tables by the time it returns (idl/amdgpu.idl says so, and it is
+ * the ioctl's own behaviour), so there is nothing still in flight when the
+ * timeline is signalled. If the VA path ever becomes asynchronous, this
+ * becomes a lie that presents as a GPU reading a mapping that does not
+ * exist yet, so it is worth stating plainly here.
+ *
+ * Not optional, either: Mesa hands a VM timeline syncobj to *every* VA
+ * operation (amdgpu_bo.c) and then makes that timeline a dependency of the
+ * submission using the mapping (amdgpu_cs.cpp). Rejecting the call, which is
+ * what this did before, left the submission waiting on a point nothing ever
+ * signalled — a hang rather than an error.
+ */
 int ac_drm_bo_va_op_raw2(ac_drm_device *dev, uint32_t bo_handle_in, uint64_t offset, uint64_t size,
                          uint64_t addr, uint64_t flags, uint32_t ops,
                          uint32_t vm_timeline_syncobj_out, uint64_t vm_timeline_point,
                          uint64_t input_fence_syncobj_handles, uint32_t num_syncobj_handles)
 {
-   /* The syncobj-carrying variant. With no syncobj support the extra
-    * arguments cannot be honoured, and silently ignoring them would drop
-    * ordering the caller asked for — so accept only the degenerate case. */
-   if (vm_timeline_syncobj_out || vm_timeline_point || input_fence_syncobj_handles ||
-       num_syncobj_handles)
-      return -ENOTSUP;
-   return ac_drm_bo_va_op_raw(dev, bo_handle_in, offset, size, addr, flags, ops);
+   int r;
+
+   /* Wait for whatever the caller says must land first. A zero timeout
+    * would poll; this blocks, because the mapping below must not be applied
+    * until these have completed. */
+   if (num_syncobj_handles && input_fence_syncobj_handles) {
+      const uint32_t *fences = (const uint32_t *)(uintptr_t)input_fence_syncobj_handles;
+      uint32_t first = 0;
+
+      r = etos_amdgpu_syncobj_wait(fences, num_syncobj_handles, UINT64_MAX,
+                                   DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, &first);
+      if (r)
+         return -EINVAL;
+   }
+
+   r = ac_drm_bo_va_op_raw(dev, bo_handle_in, offset, size, addr, flags, ops);
+   if (r)
+      return r;
+
+   if (vm_timeline_syncobj_out) {
+      r = etos_amdgpu_syncobj_timeline_signal(&vm_timeline_syncobj_out, &vm_timeline_point, 1);
+      if (r)
+         return -EINVAL;
+   }
+   return 0;
 }
 
 int ac_drm_va_range_alloc(ac_drm_device *dev, enum amdgpu_gpu_va_range va_range_type,

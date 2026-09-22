@@ -68,6 +68,8 @@ int   etos_amdgpu_syncobj_transfer(uint32_t dst, uint64_t dst_point, uint32_t sr
                                    uint64_t src_point, uint32_t flags);
 int   etos_amdgpu_syncobj_query(const uint32_t *handles, uint32_t count,
                                 uint64_t *out_points);
+int   etos_amdgpu_syncobj_timeline_signal(const uint32_t *handles,
+                                          const uint64_t *points, uint32_t count);
 
 /* The `ac_drm_*` API this file implements is declared by
  * `ac_linux_drm.h`, not here — that is the whole point of replacing
