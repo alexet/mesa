@@ -198,7 +198,11 @@ if with_gfx_compute
   )
 endif
 
-if not with_platform_windows
+# etos replaces this dispatcher outright rather than adding a third backend
+# branch to it (see src/amd/common/etos/ac_drm_etos.h) -- there is exactly
+# one backend on etos, and branching would leave ~59 dead libdrm tails
+# referencing symbols that do not exist there.
+if not with_platform_windows and not with_etos_amdgpu
   amd_common_files += files(
     'ac_linux_drm.c',
   )

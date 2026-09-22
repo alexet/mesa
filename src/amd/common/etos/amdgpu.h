@@ -43,6 +43,20 @@ typedef struct amdgpu_va *amdgpu_va_handle;
 typedef struct amdgpu_bo_list *amdgpu_bo_list_handle;
 typedef struct amdgpu_context *amdgpu_context_handle;
 
+/* Both of these are declared by Mesa itself in ac_linux_drm.h's `_WIN32`
+ * fallback block, and by libdrm's amdgpu.h otherwise. The etos build takes
+ * neither path — it keeps the real `drm-uapi/amdgpu_drm.h` (so UAPI structs
+ * match drm-kmod's exactly, which the command-submission payload depends on)
+ * and replaces only libdrm's header with this one. So they belong here. */
+enum amdgpu_gpu_va_range {
+   amdgpu_gpu_va_range_general = 0,
+};
+
+enum amdgpu_sw_info {
+   amdgpu_sw_info_address32_hi = 0,
+   amdgpu_sw_info_address_prt_wa_control_bit = 1,
+};
+
 enum amdgpu_bo_handle_type {
    amdgpu_bo_handle_type_gem_flink_name = 0,
    amdgpu_bo_handle_type_dma_buf_fd = 1,

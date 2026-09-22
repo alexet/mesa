@@ -2,20 +2,47 @@
  * Copyright 2026 The etos authors
  * SPDX-License-Identifier: MIT
  *
- * See ac_drm_etos.h for what this is and why it exists.
+ * The etos implementation of the `ac_drm_*` API — see ac_drm_etos.h for the
+ * chain it sits in and why it replaces `ac_linux_drm.c` rather than adding a
+ * branch to it.
+ *
+ * Unimplemented entry points return `-ENOTSUP` rather than being omitted.
+ * Omitting them would be a link error at the end of a long build naming a
+ * symbol with no context; returning `-ENOTSUP` fails at the call site, in a
+ * driver that mostly works, with the driver's own error path to report it.
+ * Each one says what it would take to implement it.
  */
 
 #include "ac_drm_etos.h"
+#include "ac_linux_drm.h"
 
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include "util/u_sync_provider.h"
+
 /*
- * `drm_amdgpu_info` in one call. The protocol passes the reply through as
- * the UAPI struct for whichever query was asked, verbatim (idl/amdgpu.idl),
- * so this is a thin size-checked wrapper rather than a translation.
+ * One device per process — amdgpu-glue holds the session, so this carries
+ * only what Mesa insists on being handed back.
  */
+struct ac_drm_device {
+   struct util_sync_provider sync;
+   /* The VA allocator's window, from AMDGPU_INFO_DEV_INFO. */
+   uint64_t va_start;
+   uint64_t va_end;
+   uint64_t va_next;
+};
+
+static struct ac_drm_device etos_dev;
+
+/* A VA reservation. libdrm does this bookkeeping in userspace too — it makes
+ * no ioctl — so it is ours to do, not the protocol's. */
+struct amdgpu_va {
+   uint64_t base;
+   uint64_t size;
+};
+
 static int etos_query(uint32_t query, uint32_t arg0, uint32_t arg1, void *out,
                       uint32_t size)
 {
@@ -27,71 +54,177 @@ static int etos_query(uint32_t query, uint32_t arg0, uint32_t arg1, void *out,
    memset(out, 0, size);
    if (etos_amdgpu_query(query, arg0, arg1, (uint8_t *)out, size, &written) != 0)
       return -EINVAL;
-
-   /* A short reply means the driver's struct for this query is smaller than
-    * the one Mesa compiled against — a real UAPI skew, not something to
-    * paper over by leaving the tail as whatever was on the stack. The
-    * memset above has already zeroed it, which is what the kernel would
-    * have done for a field it does not know about. */
    return 0;
 }
 
-int ac_drm_etos_device_initialize(uint32_t *major, uint32_t *minor)
+/* ── sync provider ───────────────────────────────────────────────────────
+ *
+ * radeonsi asks the device for one and uses it for every syncobj operation.
+ * The protocol's syncobj methods report `Unsupported` today
+ * (drivers/drmd/src/amdgpu/session.rs), so these do too — consistently,
+ * rather than half-working. Explicit synchronisation is what needs them, and
+ * that is a later milestone.
+ */
+static int sync_enotsup_create(struct util_sync_provider *p, uint32_t flags, uint32_t *handle)
+{ (void)p; (void)flags; (void)handle; return -ENOTSUP; }
+static int sync_enotsup_destroy(struct util_sync_provider *p, uint32_t handle)
+{ (void)p; (void)handle; return -ENOTSUP; }
+static int sync_enotsup_handle_to_fd(struct util_sync_provider *p, uint32_t handle, int *fd)
+{ (void)p; (void)handle; (void)fd; return -ENOTSUP; }
+static int sync_enotsup_fd_to_handle(struct util_sync_provider *p, int fd, uint32_t *handle)
+{ (void)p; (void)fd; (void)handle; return -ENOTSUP; }
+static int sync_enotsup_import_sync_file(struct util_sync_provider *p, uint32_t h, int fd)
+{ (void)p; (void)h; (void)fd; return -ENOTSUP; }
+static int sync_enotsup_export_sync_file(struct util_sync_provider *p, uint32_t h, int *fd)
+{ (void)p; (void)h; (void)fd; return -ENOTSUP; }
+static int sync_enotsup_wait(struct util_sync_provider *p, uint32_t *handles, unsigned n,
+                             int64_t timeout, unsigned flags, uint32_t *first)
+{ (void)p; (void)handles; (void)n; (void)timeout; (void)flags; (void)first; return -ENOTSUP; }
+static int sync_enotsup_reset(struct util_sync_provider *p, const uint32_t *handles, uint32_t n)
+{ (void)p; (void)handles; (void)n; return -ENOTSUP; }
+static int sync_enotsup_signal(struct util_sync_provider *p, const uint32_t *handles, uint32_t n)
+{ (void)p; (void)handles; (void)n; return -ENOTSUP; }
+static int sync_enotsup_timeline_signal(struct util_sync_provider *p, const uint32_t *handles,
+                                        uint64_t *points, uint32_t n)
+{ (void)p; (void)handles; (void)points; (void)n; return -ENOTSUP; }
+static int sync_enotsup_timeline_wait(struct util_sync_provider *p, uint32_t *handles,
+                                      uint64_t *points, unsigned n, int64_t timeout,
+                                      unsigned flags, uint32_t *first)
+{ (void)p; (void)handles; (void)points; (void)n; (void)timeout; (void)flags; (void)first;
+  return -ENOTSUP; }
+static int sync_enotsup_query(struct util_sync_provider *p, uint32_t *handles, uint64_t *points,
+                              uint32_t n, uint32_t flags)
+{ (void)p; (void)handles; (void)points; (void)n; (void)flags; return -ENOTSUP; }
+static int sync_enotsup_transfer(struct util_sync_provider *p, uint32_t dh, uint64_t dp,
+                                 uint32_t sh, uint64_t sp, uint32_t flags)
+{ (void)p; (void)dh; (void)dp; (void)sh; (void)sp; (void)flags; return -ENOTSUP; }
+static void sync_noop_finalize(struct util_sync_provider *p) { (void)p; }
+static struct util_sync_provider *sync_clone(struct util_sync_provider *p) { return p; }
+
+static void etos_sync_init(struct util_sync_provider *p)
 {
+   p->create = sync_enotsup_create;
+   p->destroy = sync_enotsup_destroy;
+   p->handle_to_fd = sync_enotsup_handle_to_fd;
+   p->fd_to_handle = sync_enotsup_fd_to_handle;
+   p->import_sync_file = sync_enotsup_import_sync_file;
+   p->export_sync_file = sync_enotsup_export_sync_file;
+   p->wait = sync_enotsup_wait;
+   p->reset = sync_enotsup_reset;
+   p->signal = sync_enotsup_signal;
+   p->timeline_signal = sync_enotsup_timeline_signal;
+   p->timeline_wait = sync_enotsup_timeline_wait;
+   p->query = sync_enotsup_query;
+   p->transfer = sync_enotsup_transfer;
+   p->finalize = sync_noop_finalize;
+   p->clone = sync_clone;
+}
+
+/* ── device ──────────────────────────────────────────────────────────────*/
+
+int ac_drm_device_initialize(int fd, bool is_virtio, uint32_t *major_version,
+                             uint32_t *minor_version, ac_drm_device **device_handle)
+{
+   struct drm_amdgpu_info_device dev = {0};
+
+   (void)fd;        /* there is no fd on etos */
+   if (is_virtio)
+      return -ENOTSUP;
+
    if (etos_amdgpu_init() != 0)
       return -ENODEV;
 
-   /* The DRM interface version drmd's amdgpu reports. Mesa gates optional
-    * features on the minor (`ac_gpu_info.c` requires >= 54 and checks up to
-    * 60), so this has to be the real one rather than a placeholder —
-    * reported by the driver itself via AMDGPU_INFO_... would be better, but
-    * there is no query for it; it is the drm_version, which on etos has no
-    * carrier yet. 3.59 is what 3rd-party/drm-kmod's KMS_DRIVER_MINOR says.
-    */
-   if (major)
-      *major = 3;
-   if (minor)
-      *minor = 59;
+   etos_sync_init(&etos_dev.sync);
+
+   /* The VA window this process may allocate from. `ac_drm_va_range_alloc`
+    * hands pieces of it out; amdgpu validates every address anyway, so a
+    * bug here is rejected rather than silently mapped. */
+   if (etos_query(AMDGPU_INFO_DEV_INFO, 0, 0, &dev, sizeof(dev)) == 0) {
+      etos_dev.va_start = dev.virtual_address_offset;
+      etos_dev.va_end = dev.virtual_address_max;
+   }
+   if (etos_dev.va_end <= etos_dev.va_start) {
+      /* DEV_INFO did not answer. Rather than guess a window — a wrong one
+       * produces addresses the GPU faults on, which reads as corruption —
+       * refuse to initialise. */
+      return -ENODEV;
+   }
+   etos_dev.va_next = etos_dev.va_start;
+
+   /* drm-kmod's KMS_DRIVER_{MAJOR,MINOR}. Mesa gates optional features on
+    * the minor (`ac_gpu_info.c` requires >= 54, checks up to 60), so this
+    * has to be the real one. There is no drm_version carrier in the
+    * protocol to read it from yet. */
+   if (major_version)
+      *major_version = 3;
+   if (minor_version)
+      *minor_version = 59;
+   if (device_handle)
+      *device_handle = &etos_dev;
    return 0;
 }
 
-void ac_drm_etos_device_deinitialize(void)
+struct util_sync_provider *ac_drm_device_get_sync_provider(ac_drm_device *dev)
 {
-   /* The session closes with the process. Nothing to do here that dropping
-    * the capabilities does not already do — and drmd runs amdgpu's
-    * `postclose` when it does, tearing down the VM and releasing the BOs. */
+   return dev ? &dev->sync : NULL;
 }
 
-int ac_drm_etos_query_info(unsigned info_id, unsigned size, void *value)
+uintptr_t ac_drm_device_get_cookie(ac_drm_device *dev)
 {
+   /* Mesa uses this only to tell two devices apart. One per process here. */
+   return (uintptr_t)dev;
+}
+
+void ac_drm_device_deinitialize(ac_drm_device *dev)
+{
+   /* The session closes with the process, and drmd runs amdgpu's postclose
+    * when its capabilities drop — tearing down the VM and releasing the
+    * BOs. Nothing to add. */
+   (void)dev;
+}
+
+int ac_drm_device_get_fd(ac_drm_device *dev)
+{
+   /* There is no fd. Mesa passes this to things that would ioctl on it, all
+    * of which are replaced here — a negative value makes any path that did
+    * slip through fail loudly rather than act on fd 0. */
+   (void)dev;
+   return -1;
+}
+
+/* ── queries ─────────────────────────────────────────────────────────────*/
+
+int ac_drm_query_info(ac_drm_device *dev, unsigned info_id, unsigned size, void *value)
+{
+   (void)dev;
    return etos_query(info_id, 0, 0, value, size);
 }
 
-int ac_drm_etos_query_hw_ip_info(unsigned type, unsigned ip_instance,
-                                 struct drm_amdgpu_info_hw_ip *info)
+int ac_drm_query_hw_ip_info(ac_drm_device *dev, unsigned type, unsigned ip_instance,
+                            struct drm_amdgpu_info_hw_ip *info)
 {
-   return etos_query(AMDGPU_INFO_HW_IP_INFO, type, ip_instance, info,
-                     sizeof(*info));
+   (void)dev;
+   return etos_query(AMDGPU_INFO_HW_IP_INFO, type, ip_instance, info, sizeof(*info));
 }
 
-int ac_drm_etos_query_hw_ip_count(unsigned type, uint32_t *count)
+int ac_drm_query_hw_ip_count(ac_drm_device *dev, unsigned type, uint32_t *count)
 {
+   (void)dev;
    return etos_query(AMDGPU_INFO_HW_IP_COUNT, type, 0, count, sizeof(*count));
 }
 
-int ac_drm_etos_query_firmware_version(unsigned fw_type, unsigned ip_instance,
-                                       unsigned index, uint32_t *version,
-                                       uint32_t *feature)
+int ac_drm_query_firmware_version(ac_drm_device *dev, unsigned fw_type, unsigned ip_instance,
+                                  unsigned index, uint32_t *version, uint32_t *feature)
 {
    struct drm_amdgpu_info_firmware fw = {0};
    int r;
 
-   /* `index` rides in the same word as the IP instance for this query — the
-    * union's per-query fields are all u32-shaped and start at the same
-    * offset, which is why the protocol's `Query` takes two generic args
-    * rather than modelling each query's own struct. */
-   r = etos_query(AMDGPU_INFO_FW_VERSION, fw_type, ip_instance | (index << 16),
-                  &fw, sizeof(fw));
+   (void)dev;
+   /* The union's per-query fields are all u32-shaped at the same offset,
+    * which is why the protocol's `Query` takes two generic words instead of
+    * modelling each query's struct. */
+   r = etos_query(AMDGPU_INFO_FW_VERSION, fw_type, ip_instance | (index << 16), &fw,
+                  sizeof(fw));
    if (r)
       return r;
 
@@ -102,60 +235,59 @@ int ac_drm_etos_query_firmware_version(unsigned fw_type, unsigned ip_instance,
    return 0;
 }
 
-int ac_drm_etos_query_gpu_info(struct amdgpu_gpu_info *info)
+int ac_drm_query_gpu_info(ac_drm_device *dev, struct amdgpu_gpu_info *info)
 {
-   struct drm_amdgpu_info_device dev = {0};
+   struct drm_amdgpu_info_device d = {0};
    int r;
 
+   (void)dev;
    if (!info)
       return -EINVAL;
 
-   r = etos_query(AMDGPU_INFO_DEV_INFO, 0, 0, &dev, sizeof(dev));
+   r = etos_query(AMDGPU_INFO_DEV_INFO, 0, 0, &d, sizeof(d));
    if (r)
       return r;
 
    memset(info, 0, sizeof(*info));
-   info->asic_id = dev.device_id;
-   info->chip_rev = dev.chip_rev;
-   info->chip_external_rev = dev.external_rev;
-   info->family_id = dev.family;
-   info->ids_flags = dev.ids_flags;
-   info->max_engine_clk = dev.max_engine_clock;
-   info->max_memory_clk = dev.max_memory_clock;
-   info->num_shader_engines = dev.num_shader_engines;
-   info->num_shader_arrays_per_engine = dev.num_shader_arrays_per_engine;
-   info->cache_size = dev.gs_vgt_table_depth;
-   info->num_tile_pipes = dev.num_tile_pipes;
-   info->pipe_interleave_bytes = dev.pipe_interleave_size;
-   info->num_hw_gfx_contexts = dev.num_hw_gfx_contexts;
-   info->enabled_rb_pipes_mask = dev.enabled_rb_pipes_mask;
-   info->gpu_counter_freq = dev.gpu_counter_freq;
-   info->vram_type = dev.vram_type;
-   info->vram_bit_width = dev.vram_bit_width;
-   info->ce_ram_size = dev.ce_ram_size;
-   info->vce_harvest_config = dev.vce_harvest_config;
-   info->pci_rev_id = dev.pci_rev;
+   info->asic_id = d.device_id;
+   info->chip_rev = d.chip_rev;
+   info->chip_external_rev = d.external_rev;
+   info->family_id = d.family;
+   info->ids_flags = d.ids_flags;
+   info->max_engine_clk = d.max_engine_clock;
+   info->max_memory_clk = d.max_memory_clock;
+   info->num_shader_engines = d.num_shader_engines;
+   info->num_shader_arrays_per_engine = d.num_shader_arrays_per_engine;
+   info->num_hw_gfx_contexts = d.num_hw_gfx_contexts;
+   info->enabled_rb_pipes_mask = d.enabled_rb_pipes_mask;
+   info->gpu_counter_freq = d.gpu_counter_freq;
+   info->vram_type = d.vram_type;
+   info->vram_bit_width = d.vram_bit_width;
+   info->ce_ram_size = d.ce_ram_size;
+   info->vce_harvest_config = d.vce_harvest_config;
+   info->pci_rev_id = d.pci_rev;
 
-   /* The two register-derived fields Mesa actually reads. */
-   info->gb_addr_cfg = dev.gb_addr_cfg;
-
-   /* `mc_arb_ramcfg` and the tile-mode arrays come from MMIO reads
-    * (AMDGPU_INFO_READ_MMR_REG) in libdrm. Left zero here: `ac_gpu_info.c`
-    * only consults them through `ac_fill_tiling_info`, which is pre-GFX9
-    * tiling, and this port targets GFX10. If a pre-GFX9 ASIC is ever in
-    * scope, this is the place that has to grow a register-read query — a
-    * zero here would silently produce wrong tiling rather than an error,
-    * so it is called out rather than left to be discovered.
-    */
+   /* Left zero, deliberately: `gb_addr_cfg`, `mc_arb_ramcfg`, the tile-mode
+    * arrays, `num_tile_pipes` and `pipe_interleave_bytes` are not in
+    * `drm_amdgpu_info_device` at all — libdrm derives them from MMIO reads
+    * (AMDGPU_INFO_READ_MMR_REG). Mesa consults them only through
+    * `ac_fill_tiling_info`, which is pre-GFX9 tiling, and this port targets
+    * GFX10.
+    *
+    * Called out rather than left silent because a zero here would produce
+    * *wrong tiling* rather than an error if a pre-GFX9 ASIC ever came into
+    * scope. `ac_drm_read_mm_registers` below is the route to filling them
+    * when that day comes. */
    return 0;
 }
 
-int ac_drm_etos_query_heap_info(uint32_t heap, uint32_t flags,
-                                struct amdgpu_heap_info *info)
+int ac_drm_query_heap_info(ac_drm_device *dev, uint32_t heap, uint32_t flags,
+                           struct amdgpu_heap_info *info)
 {
    struct drm_amdgpu_memory_info mem = {0};
    int r;
 
+   (void)dev;
    if (!info)
       return -EINVAL;
 
@@ -187,80 +319,303 @@ int ac_drm_etos_query_heap_info(uint32_t heap, uint32_t flags,
    return 0;
 }
 
-int ac_drm_etos_query_sw_info(unsigned info, void *value)
+int ac_drm_query_pci_bus_info(ac_drm_device *dev, struct radeon_info *info)
 {
-   /* libdrm answers exactly one of these (`amdgpu_sw_info_address32_hi`)
-    * from state it keeps itself, not from the kernel. The winsys uses it to
-    * place 32-bit-addressable allocations. Reported as unsupported rather
-    * than guessed: a wrong high half here puts every such allocation at an
-    * address the GPU cannot reach, which would look like corruption rather
-    * than a failed query. */
+   /* libdrm fills this from the DRM device node's sysfs path. etos has
+    * neither, and the winsys only uses it for reporting — so it is left
+    * untouched rather than invented. */
+   (void)dev;
+   (void)info;
+   return -ENOTSUP;
+}
+
+void ac_drm_query_has_vm_always_valid(ac_drm_device *dev, struct radeon_info *info)
+{
+   /* Detected by attempting a VM_ALWAYS_VALID allocation on libdrm. Left
+    * alone: the caller's default (not available) is the safe reading, and a
+    * wrong `true` here would have the winsys skip adding BOs to submissions
+    * that genuinely need to be there. */
+   (void)dev;
+   (void)info;
+}
+
+int ac_drm_query_sw_info(ac_drm_device *dev, enum amdgpu_sw_info info, void *value)
+{
+   /* libdrm answers `address32_hi` from state it keeps itself. The winsys
+    * places 32-bit-addressable allocations with it, so a wrong value puts
+    * them where the GPU cannot reach — which looks like corruption, not a
+    * failed query. Unsupported until there is a real answer. */
+   (void)dev;
    (void)info;
    (void)value;
    return -ENOTSUP;
 }
 
-int ac_drm_etos_bo_alloc(struct amdgpu_bo_alloc_request *req, uint32_t *handle)
+int ac_drm_query_sensor_info(ac_drm_device *dev, unsigned sensor_type, unsigned size, void *value)
 {
-   if (!req || !handle)
+   (void)dev;
+   return etos_query(AMDGPU_INFO_SENSOR, sensor_type, 0, value, size);
+}
+
+int ac_drm_query_video_caps_info(ac_drm_device *dev, unsigned cap_type, unsigned size, void *value)
+{
+   /* Video decode/encode is compiled out of drmd (VCN/UVD/JPEG are dormant),
+    * so there is nothing behind this. */
+   (void)dev; (void)cap_type; (void)size; (void)value;
+   return -ENOTSUP;
+}
+
+int ac_drm_query_gpuvm_fault_info(ac_drm_device *dev, unsigned size, void *value)
+{
+   (void)dev;
+   return etos_query(AMDGPU_INFO_GPUVM_FAULT, 0, 0, value, size);
+}
+
+int ac_drm_query_uq_fw_area_info(ac_drm_device *dev, unsigned type, unsigned ip_instance,
+                                 struct drm_amdgpu_info_uq_metadata *info)
+{
+   /* User queues are not offered — see ac_drm_create_userqueue. */
+   (void)dev; (void)type; (void)ip_instance; (void)info;
+   return -ENOTSUP;
+}
+
+int ac_drm_read_mm_registers(ac_drm_device *dev, unsigned dword_offset, unsigned count,
+                             uint32_t instance, uint32_t flags, uint32_t *values)
+{
+   /* AMDGPU_INFO_READ_MMR_REG. Needed only for pre-GFX9 tiling info (see
+    * ac_drm_query_gpu_info); routed through the protocol's Query rather than
+    * stubbed, since it is a plain query and costs nothing to support. */
+   (void)dev;
+   if (!values || count == 0)
+      return -EINVAL;
+   return etos_query(AMDGPU_INFO_READ_MMR_REG, dword_offset, instance | (flags << 16),
+                     values, count * sizeof(uint32_t));
+}
+
+const char *ac_drm_get_marketing_name(ac_drm_device *device)
+{
+   /* libdrm reads this from its bundled amdgpu.ids table, which etos does
+    * not ship. NULL is a value the caller already handles (it falls back to
+    * the chip name from DEV_INFO). */
+   (void)device;
+   return NULL;
+}
+
+/* ── buffer objects ──────────────────────────────────────────────────────
+ *
+ * `ac_drm_bo` is a union of backend-private handles. Ours is the GEM handle
+ * the protocol uses, carried in the pointer field — the same trick the
+ * virtio backend plays with its own type.
+ */
+static inline uint32_t bo_handle(ac_drm_bo bo) { return (uint32_t)(uintptr_t)bo.abo; }
+static inline ac_drm_bo bo_from_handle(uint32_t h)
+{
+   ac_drm_bo bo;
+   memset(&bo, 0, sizeof(bo));
+   bo.abo = (amdgpu_bo_handle)(uintptr_t)h;
+   return bo;
+}
+
+int ac_drm_bo_alloc(ac_drm_device *dev, struct amdgpu_bo_alloc_request *alloc_buffer,
+                    ac_drm_bo *bo)
+{
+   uint32_t handle = 0;
+
+   (void)dev;
+   if (!alloc_buffer || !bo)
       return -EINVAL;
 
-   if (etos_amdgpu_bo_alloc(req->alloc_size, req->phys_alignment,
-                            req->preferred_heap, req->flags, handle) != 0)
+   if (etos_amdgpu_bo_alloc(alloc_buffer->alloc_size, alloc_buffer->phys_alignment,
+                            alloc_buffer->preferred_heap, alloc_buffer->flags,
+                            &handle) != 0)
       return -ENOMEM;
+
+   *bo = bo_from_handle(handle);
    return 0;
 }
 
-int ac_drm_etos_bo_free(uint32_t handle)
+int ac_drm_bo_free(ac_drm_device *dev, ac_drm_bo bo)
 {
-   etos_amdgpu_bo_free(handle);
+   (void)dev;
+   etos_amdgpu_bo_free(bo_handle(bo));
    return 0;
 }
 
-int ac_drm_etos_bo_cpu_map(uint32_t handle, void **cpu)
+int ac_drm_bo_cpu_map(ac_drm_device *dev, ac_drm_bo bo, void **cpu)
 {
    void *p;
 
+   (void)dev;
    if (!cpu)
       return -EINVAL;
 
-   p = etos_amdgpu_bo_map(handle);
+   p = etos_amdgpu_bo_map(bo_handle(bo));
    if (!p)
       return -ENOMEM;
    *cpu = p;
    return 0;
 }
 
-int ac_drm_etos_bo_cpu_unmap(uint32_t handle)
+int ac_drm_bo_cpu_unmap(ac_drm_device *dev, ac_drm_bo bo)
 {
-   etos_amdgpu_bo_unmap(handle);
+   (void)dev;
+   etos_amdgpu_bo_unmap(bo_handle(bo));
    return 0;
 }
 
-int ac_drm_etos_bo_query_info(uint32_t handle, struct amdgpu_bo_info *info)
+int ac_drm_bo_query_info(ac_drm_device *dev, uint32_t bo_handle_in, struct amdgpu_bo_info *info)
 {
-   (void)handle;
-   if (!info)
-      return -EINVAL;
-   /* The protocol has `BoQueryInfo`, but the winsys only calls this for
-    * imported BOs (to learn an allocation it did not make), and import is
-    * not supported on etos yet — buffer sharing between processes is
-    * "hand the AmdgpuBo capability over", a design question deferred in
-    * idl/amdgpu.idl's header. Unsupported rather than a zeroed struct,
-    * which would read as a zero-sized allocation. */
+   /* Only called for imported BOs, to learn an allocation this process did
+    * not make. Import is not supported (see ac_drm_bo_import), so neither is
+    * this — a zeroed struct would read as a zero-sized allocation. */
+   (void)dev; (void)bo_handle_in; (void)info;
    return -ENOTSUP;
 }
 
-int ac_drm_etos_bo_va_op_raw(uint64_t bo_handle, uint64_t offset, uint64_t size,
-                             uint64_t addr, uint64_t flags, uint32_t ops)
+int ac_drm_bo_set_metadata(ac_drm_device *dev, uint32_t bo_handle_in,
+                           struct amdgpu_bo_metadata *info)
 {
-   if (etos_amdgpu_va_op((uint32_t)bo_handle, ops, addr, offset, size, flags) != 0)
+   /* Tiling metadata for the display path, read back by whoever imports the
+    * BO. Without import there is no reader. */
+   (void)dev; (void)bo_handle_in; (void)info;
+   return -ENOTSUP;
+}
+
+int ac_drm_bo_wait_for_idle(ac_drm_device *dev, ac_drm_bo bo, uint64_t timeout_ns, bool *busy)
+{
+   /* DRM_AMDGPU_GEM_WAIT_IDLE. The protocol has no per-BO idle wait — a
+    * submission is waited on through its fence (`ac_drm_cs_query_fence_status`),
+    * which is what the winsys uses for everything except this one
+    * convenience path. */
+   (void)dev; (void)bo; (void)timeout_ns;
+   if (busy)
+      *busy = false;
+   return -ENOTSUP;
+}
+
+int ac_drm_bo_export(ac_drm_device *dev, ac_drm_bo bo, enum amdgpu_bo_handle_type type,
+                     uint32_t *shared_handle)
+{
+   /* Sharing a BO between processes is "hand the AmdgpuBo capability over"
+    * on etos, not an fd or a flink name — a design question deferred in
+    * idl/amdgpu.idl's header, not a translation. */
+   (void)dev; (void)bo; (void)type; (void)shared_handle;
+   return -ENOTSUP;
+}
+
+int ac_drm_bo_import(ac_drm_device *dev, enum amdgpu_bo_handle_type type,
+                     uint32_t shared_handle, struct ac_drm_bo_import_result *output)
+{
+   (void)dev; (void)type; (void)shared_handle; (void)output;
+   return -ENOTSUP;
+}
+
+int ac_drm_create_bo_from_user_mem(ac_drm_device *dev, void *cpu, uint64_t size, ac_drm_bo *bo)
+{
+   /* Userptr BOs: pin this process's own pages and let the GPU read them.
+    * Needs `amdgpu_gem_userptr_ioctl` plus a way to name a client's pages to
+    * drmd, which the protocol has no method for. */
+   (void)dev; (void)cpu; (void)size; (void)bo;
+   return -ENOTSUP;
+}
+
+/* ── GPU virtual address space ───────────────────────────────────────────*/
+
+int ac_drm_bo_va_op(ac_drm_device *dev, uint32_t bo_handle_in, uint64_t offset, uint64_t size,
+                    uint64_t addr, uint64_t flags, uint32_t ops)
+{
+   /* The non-raw form adds the default page flags libdrm applies. */
+   return ac_drm_bo_va_op_raw(dev, bo_handle_in, offset, size, addr,
+                              flags | AMDGPU_VM_PAGE_READABLE | AMDGPU_VM_PAGE_WRITEABLE |
+                                 AMDGPU_VM_PAGE_EXECUTABLE,
+                              ops);
+}
+
+int ac_drm_bo_va_op_raw(ac_drm_device *dev, uint32_t bo_handle_in, uint64_t offset, uint64_t size,
+                        uint64_t addr, uint64_t flags, uint32_t ops)
+{
+   (void)dev;
+   if (etos_amdgpu_va_op(bo_handle_in, ops, addr, offset, size, flags) != 0)
       return -EINVAL;
    return 0;
 }
 
-int ac_drm_etos_cs_ctx_create2(uint32_t priority, uint32_t *ctx_id)
+int ac_drm_bo_va_op_raw2(ac_drm_device *dev, uint32_t bo_handle_in, uint64_t offset, uint64_t size,
+                         uint64_t addr, uint64_t flags, uint32_t ops,
+                         uint32_t vm_timeline_syncobj_out, uint64_t vm_timeline_point,
+                         uint64_t input_fence_syncobj_handles, uint32_t num_syncobj_handles)
 {
+   /* The syncobj-carrying variant. With no syncobj support the extra
+    * arguments cannot be honoured, and silently ignoring them would drop
+    * ordering the caller asked for — so accept only the degenerate case. */
+   if (vm_timeline_syncobj_out || vm_timeline_point || input_fence_syncobj_handles ||
+       num_syncobj_handles)
+      return -ENOTSUP;
+   return ac_drm_bo_va_op_raw(dev, bo_handle_in, offset, size, addr, flags, ops);
+}
+
+int ac_drm_va_range_alloc(ac_drm_device *dev, enum amdgpu_gpu_va_range va_range_type,
+                          uint64_t size, uint64_t va_base_alignment, uint64_t va_base_required,
+                          uint64_t *va_base_allocated, amdgpu_va_handle *va_range_handle,
+                          uint64_t flags)
+{
+   struct amdgpu_va *va;
+   uint64_t base;
+
+   (void)flags;
+   if (!dev || !va_base_allocated || !va_range_handle || size == 0)
+      return -EINVAL;
+   if (va_range_type != amdgpu_gpu_va_range_general)
+      return -ENOTSUP;
+
+   /* Bump allocation, never reused. libdrm keeps a real free-list here; this
+    * does not, and the window is 256 TiB wide (`virtual_address_max`), so a
+    * process would have to churn an implausible number of allocations to
+    * exhaust it. Worth revisiting if a long-running compositor ever does. */
+   base = va_base_required ? va_base_required : etos_dev.va_next;
+   if (va_base_alignment > 1)
+      base = (base + va_base_alignment - 1) & ~(va_base_alignment - 1);
+
+   if (base < etos_dev.va_start || base + size > etos_dev.va_end)
+      return -ENOMEM;
+
+   va = calloc(1, sizeof(*va));
+   if (!va)
+      return -ENOMEM;
+   va->base = base;
+   va->size = size;
+
+   if (!va_base_required)
+      etos_dev.va_next = base + size;
+
+   *va_base_allocated = base;
+   *va_range_handle = va;
+   return 0;
+}
+
+int ac_drm_va_range_free(amdgpu_va_handle va_range_handle)
+{
+   free(va_range_handle);
+   return 0;
+}
+
+int ac_drm_va_range_query(ac_drm_device *dev, enum amdgpu_gpu_va_range type, uint64_t *start,
+                          uint64_t *end)
+{
+   if (!dev || type != amdgpu_gpu_va_range_general)
+      return -EINVAL;
+   if (start)
+      *start = dev->va_start;
+   if (end)
+      *end = dev->va_end;
+   return 0;
+}
+
+/* ── contexts and submission ─────────────────────────────────────────────*/
+
+int ac_drm_cs_ctx_create2(ac_drm_device *dev, uint32_t priority, uint32_t *ctx_id)
+{
+   (void)dev;
    if (!ctx_id)
       return -EINVAL;
    if (etos_amdgpu_ctx_create((int32_t)priority, ctx_id) != 0)
@@ -268,16 +623,58 @@ int ac_drm_etos_cs_ctx_create2(uint32_t priority, uint32_t *ctx_id)
    return 0;
 }
 
-int ac_drm_etos_cs_ctx_free(uint32_t ctx_id)
+int ac_drm_cs_ctx_free(ac_drm_device *dev, uint32_t ctx_id)
 {
+   (void)dev;
    if (etos_amdgpu_ctx_free(ctx_id) != 0)
       return -EINVAL;
    return 0;
 }
 
+int ac_drm_cs_ctx_stable_pstate(ac_drm_device *dev, uint32_t ctx_id, uint32_t op, uint32_t flags,
+                                uint32_t *out_flags)
+{
+   /* Pins clocks for profiling. Nothing behind it here. */
+   (void)dev; (void)ctx_id; (void)op; (void)flags;
+   if (out_flags)
+      *out_flags = 0;
+   return -ENOTSUP;
+}
+
+int ac_drm_cs_query_reset_state2(ac_drm_device *dev, uint32_t ctx_id, uint64_t *flags)
+{
+   /* GPU reset / robustness reporting. drmd has no reset path yet — a hung
+    * client's hang takes the card with it (AmdgpuAccelDesign.md §7), so
+    * there is nothing truthful to report. */
+   (void)dev; (void)ctx_id;
+   if (flags)
+      *flags = 0;
+   return -ENOTSUP;
+}
+
+int ac_drm_cs_query_fence_status(ac_drm_device *dev, uint32_t ctx_id, uint32_t ip_type,
+                                 uint32_t ip_instance, uint32_t ring, uint64_t fence_seq_no,
+                                 uint64_t timeout_ns, uint64_t flags, uint32_t *expired)
+{
+   uint32_t signalled = 0;
+
+   (void)dev; (void)flags;
+   if (!expired)
+      return -EINVAL;
+
+   if (etos_amdgpu_wait_cs(ctx_id, ip_type, ip_instance, ring, fence_seq_no, timeout_ns,
+                           &signalled) != 0)
+      return -EINVAL;
+
+   /* "expired" means completed, which is what `signalled` reports. A timeout
+    * is a normal result on both sides, not an error. */
+   *expired = signalled;
+   return 0;
+}
+
 /*
- * Flatten Mesa's chunk array into the payload `idl/amdgpu.idl` describes and
- * `drivers/drmd/kpi/session.c` parses:
+ * Flatten Mesa's chunk array into the payload idl/amdgpu.idl describes and
+ * drivers/drmd/kpi/session.c parses:
  *
  *   u32 num_chunks; u32 _pad;
  *   struct drm_amdgpu_cs_chunk chunks[n];   // chunk_data = byte offset
@@ -288,25 +685,26 @@ int ac_drm_etos_cs_ctx_free(uint32_t ctx_id)
  * payload. Everything a chunk *names* — BO handles, GPU virtual addresses,
  * syncobj handles — is already session-relative and crosses unchanged.
  */
-int ac_drm_etos_cs_submit_raw2(uint32_t ctx_id, uint32_t bo_list_handle,
-                               int num_chunks, struct drm_amdgpu_cs_chunk *chunks,
-                               uint64_t *seq_no)
+int ac_drm_cs_submit_raw2(ac_drm_device *dev, uint32_t ctx_id, uint32_t bo_list_handle,
+                          int num_chunks, struct drm_amdgpu_cs_chunk *chunks, uint64_t *seq_no)
 {
    uint8_t *payload;
-   uint32_t header_len = 8;
+   const uint32_t header_len = 8;
    uint32_t table_len, total, off;
    struct drm_amdgpu_cs_chunk *wire;
    int i, r;
 
+   (void)dev;
+   (void)bo_list_handle; /* always 0 — see idl/amdgpu.idl on BO lists */
+
    if (num_chunks <= 0 || !chunks || !seq_no)
       return -EINVAL;
 
-   table_len = (uint32_t)num_chunks * sizeof(struct drm_amdgpu_cs_chunk);
+   table_len = (uint32_t)num_chunks * (uint32_t)sizeof(struct drm_amdgpu_cs_chunk);
    total = header_len + table_len;
    for (i = 0; i < num_chunks; i++) {
-      /* Each blob is padded to 8 so the next one stays aligned; drmd only
-       * requires dword alignment, but keeping it at 8 means the payload
-       * layout does not depend on chunk ordering. */
+      /* Each blob padded to 8, so the payload layout does not depend on
+       * chunk ordering. drmd itself only requires dword alignment. */
       total += (chunks[i].length_dw * 4 + 7) & ~7u;
    }
 
@@ -330,28 +728,75 @@ int ac_drm_etos_cs_submit_raw2(uint32_t ctx_id, uint32_t bo_list_handle,
 
    r = etos_amdgpu_submit(ctx_id, payload, total, seq_no);
    free(payload);
-
-   (void)bo_list_handle; /* always 0 — see idl/amdgpu.idl on BO lists */
    return r == 0 ? 0 : -EINVAL;
 }
 
-int ac_drm_etos_cs_query_fence_status(uint32_t ctx_id, uint32_t ip_type,
-                                      uint32_t ip_instance, uint32_t ring,
-                                      uint64_t fence_seq_no, uint64_t timeout_ns,
-                                      uint64_t flags, uint32_t *expired)
+void ac_drm_cs_chunk_fence_info_to_data(uint32_t bo_handle_in, uint64_t offset,
+                                        struct drm_amdgpu_cs_chunk_data *data)
 {
-   uint32_t signalled = 0;
-
-   if (!expired)
-      return -EINVAL;
-
-   (void)flags;
-   if (etos_amdgpu_wait_cs(ctx_id, ip_type, ip_instance, ring, fence_seq_no,
-                           timeout_ns, &signalled) != 0)
-      return -EINVAL;
-
-   /* Mesa's "expired" means "completed", which is what `signalled` reports.
-    * A timeout is a normal result on both sides, not an error. */
-   *expired = signalled;
-   return 0;
+   /* Pure marshalling, identical to libdrm's — no device involved. */
+   memset(data, 0, sizeof(*data));
+   data->fence_data.handle = bo_handle_in;
+   data->fence_data.offset = offset * sizeof(uint64_t);
 }
+
+/* ── syncobjs ────────────────────────────────────────────────────────────
+ *
+ * All unsupported, matching the sync provider above and the protocol itself
+ * (drivers/drmd/src/amdgpu/session.rs). Explicit synchronisation is a later
+ * milestone; reporting it half-working would be worse than not at all,
+ * because the winsys would build dependency chains nothing enforces.
+ */
+int ac_drm_cs_create_syncobj2(ac_drm_device *dev, uint32_t flags, uint32_t *handle)
+{ (void)dev; (void)flags; (void)handle; return -ENOTSUP; }
+int ac_drm_cs_destroy_syncobj(ac_drm_device *dev, uint32_t handle)
+{ (void)dev; (void)handle; return -ENOTSUP; }
+int ac_drm_cs_syncobj_wait(ac_drm_device *dev, uint32_t *handles, unsigned num_handles,
+                           int64_t timeout_nsec, unsigned flags, uint32_t *first_signaled)
+{ (void)dev; (void)handles; (void)num_handles; (void)timeout_nsec; (void)flags;
+  (void)first_signaled; return -ENOTSUP; }
+int ac_drm_cs_syncobj_query2(ac_drm_device *dev, uint32_t *handles, uint64_t *points,
+                             unsigned num_handles, uint32_t flags)
+{ (void)dev; (void)handles; (void)points; (void)num_handles; (void)flags; return -ENOTSUP; }
+int ac_drm_cs_import_syncobj(ac_drm_device *dev, int shared_fd, uint32_t *handle)
+{ (void)dev; (void)shared_fd; (void)handle; return -ENOTSUP; }
+int ac_drm_cs_syncobj_export_sync_file(ac_drm_device *dev, uint32_t syncobj, int *sync_file_fd)
+{ (void)dev; (void)syncobj; (void)sync_file_fd; return -ENOTSUP; }
+int ac_drm_cs_syncobj_import_sync_file(ac_drm_device *dev, uint32_t syncobj, int sync_file_fd)
+{ (void)dev; (void)syncobj; (void)sync_file_fd; return -ENOTSUP; }
+int ac_drm_cs_syncobj_export_sync_file2(ac_drm_device *dev, uint32_t syncobj, uint64_t point,
+                                        uint32_t flags, int *sync_file_fd)
+{ (void)dev; (void)syncobj; (void)point; (void)flags; (void)sync_file_fd; return -ENOTSUP; }
+int ac_drm_cs_syncobj_transfer(ac_drm_device *dev, uint32_t dst_handle, uint64_t dst_point,
+                               uint32_t src_handle, uint64_t src_point, uint32_t flags)
+{ (void)dev; (void)dst_handle; (void)dst_point; (void)src_handle; (void)src_point; (void)flags;
+  return -ENOTSUP; }
+int ac_drm_cs_syncobj_timeline_wait(ac_drm_device *dev, uint32_t *handles, uint64_t *points,
+                                    unsigned num_handles, int64_t timeout_nsec, unsigned flags,
+                                    uint32_t *first_signaled)
+{ (void)dev; (void)handles; (void)points; (void)num_handles; (void)timeout_nsec; (void)flags;
+  (void)first_signaled; return -ENOTSUP; }
+
+/* ── user queues ─────────────────────────────────────────────────────────
+ *
+ * The modern submission path. Not offered: the winsys only uses it when the
+ * kernel advertises support, and this one does not.
+ */
+int ac_drm_create_userqueue(ac_drm_device *dev, uint32_t ip_type, uint32_t doorbell_handle,
+                            uint32_t doorbell_offset, uint64_t queue_va, uint64_t queue_size,
+                            uint64_t wptr_va, uint64_t rptr_va, void *mqd_in, uint32_t flags,
+                            uint32_t *queue_id)
+{ (void)dev; (void)ip_type; (void)doorbell_handle; (void)doorbell_offset; (void)queue_va;
+  (void)queue_size; (void)wptr_va; (void)rptr_va; (void)mqd_in; (void)flags; (void)queue_id;
+  return -ENOTSUP; }
+int ac_drm_free_userqueue(ac_drm_device *dev, uint32_t queue_id)
+{ (void)dev; (void)queue_id; return -ENOTSUP; }
+int ac_drm_userq_signal(ac_drm_device *dev, struct drm_amdgpu_userq_signal *signal_data)
+{ (void)dev; (void)signal_data; return -ENOTSUP; }
+int ac_drm_userq_wait(ac_drm_device *dev, struct drm_amdgpu_userq_wait *wait_data)
+{ (void)dev; (void)wait_data; return -ENOTSUP; }
+
+int ac_drm_vm_reserve_vmid(ac_drm_device *dev, uint32_t flags)
+{ (void)dev; (void)flags; return -ENOTSUP; }
+int ac_drm_vm_unreserve_vmid(ac_drm_device *dev, uint32_t flags)
+{ (void)dev; (void)flags; return -ENOTSUP; }
