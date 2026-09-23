@@ -2,6 +2,8 @@
 #ifndef SW_HELPER_H
 #define SW_HELPER_H
 
+#include <stdio.h>
+
 #include "util/compiler.h"
 #include "util/u_debug.h"
 #include "target-helpers/sw_helper_public.h"
@@ -33,13 +35,15 @@
 #include "virgl/vtest/virgl_vtest_public.h"
 #endif
 
-/* etos: a build-time-selected variant (see the etos-virgl Meson option's
- * doc), never both this and GALLIUM_LLVMPIPE/GALLIUM_SOFTPIPE/etc in the
- * same build -- construct the etos-native virgl_winsys directly and hand it
- * to virgl_create_screen(), bypassing the generic `sw_winsys*`-wrapping
+/* etos: construct the etos-native virgl_winsys directly and hand it to
+ * virgl_create_screen(), bypassing the generic `sw_winsys*`-wrapping
  * "virpipe" path below entirely (that one talks the vtest socket protocol,
  * not etos's GpuDevice/GpuContext capabilities -- see
- * src/gallium/winsys/virgl/etos/virgl_etos_winsys.c's header). */
+ * src/gallium/winsys/virgl/etos/virgl_etos_winsys.c's header).
+ *
+ * More than one etos backend may be compiled into the same build now, and
+ * the choice between them is made *here*, at run time -- see the selection
+ * comment on sw_screen_create_named below. */
 #ifdef GALLIUM_VIRGL_ETOS
 #include "virgl/etos/virgl_etos_winsys.h"
 #endif
@@ -54,19 +58,42 @@
 #include "radeonsi/si_public.h"
 #endif
 
+/* How an etos build picks its GPU driver, when more than one is compiled in.
+ *
+ * There is no device enumeration to do it with: no DRI loader, no device
+ * nodes, and no environment to read `GALLIUM_DRIVER` from. What there is,
+ * is one `GpuDevice` capability at a well-known slot that answers `Kind()`
+ * (idl/gpu.idl). So each driver is simply asked to open it, in turn, and
+ * the one whose kind matches succeeds -- `etos_virgl_init` and
+ * `etos_amdgpu_init` both check `Kind()` and decline anything that is not
+ * theirs, so "try it and see" is a real answer here rather than a guess.
+ *
+ * That relies on declining being *harmless*, which it did not used to be:
+ * both glues took ownership of the borrowed slot and closed it on the way
+ * out, so the first driver to decline destroyed the device for the rest.
+ * See the ManuallyDrop comments in utility/{virgl,amdgpu}-glue.
+ *
+ * Order is preference, not correctness -- at most one kind can ever match.
+ */
 static inline struct pipe_screen *
 sw_screen_create_named(struct sw_winsys *winsys, const struct pipe_screen_config *config, const char *driver)
 {
    struct pipe_screen *screen = NULL;
 
 #if defined(GALLIUM_VIRGL_ETOS)
-   if (screen == NULL && (strcmp(driver, "virgl-etos") == 0 || !driver[0]))
+   if (screen == NULL && (strcmp(driver, "virgl-etos") == 0 || !driver[0])) {
       screen = virgl_etos_create_screen(config);
+      if (screen)
+         fprintf(stderr, "etos: gallium driver: virgl\n");
+   }
 #endif
 
 #if defined(GALLIUM_RADEONSI_ETOS)
-   if (screen == NULL && (strcmp(driver, "radeonsi-etos") == 0 || !driver[0]))
+   if (screen == NULL && (strcmp(driver, "radeonsi-etos") == 0 || !driver[0])) {
       screen = radeonsi_screen_create(-1, config);
+      if (screen)
+         fprintf(stderr, "etos: gallium driver: radeonsi\n");
+   }
 #endif
 
 #if defined(GALLIUM_LLVMPIPE)
