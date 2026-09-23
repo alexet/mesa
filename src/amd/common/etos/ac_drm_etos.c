@@ -19,6 +19,7 @@
 
 #include <errno.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -483,8 +484,13 @@ int ac_drm_bo_alloc(ac_drm_device *dev, struct amdgpu_bo_alloc_request *alloc_bu
 
    if (etos_amdgpu_bo_alloc(alloc_buffer->alloc_size, alloc_buffer->phys_alignment,
                             alloc_buffer->preferred_heap, alloc_buffer->flags,
-                            &handle) != 0)
+                            &handle) != 0) {
+      fprintf(stderr, "etos: bo_alloc failed: size=%llu heap=%x flags=%llx\n",
+              (unsigned long long)alloc_buffer->alloc_size,
+              alloc_buffer->preferred_heap,
+              (unsigned long long)alloc_buffer->flags);
       return -ENOMEM;
+   }
 
    *bo = bo_from_handle(handle);
    return 0;
@@ -552,11 +558,36 @@ int ac_drm_bo_wait_for_idle(ac_drm_device *dev, ac_drm_bo bo, uint64_t timeout_n
 int ac_drm_bo_export(ac_drm_device *dev, ac_drm_bo bo, enum amdgpu_bo_handle_type type,
                      uint32_t *shared_handle)
 {
-   /* Sharing a BO between processes is "hand the AmdgpuBo capability over"
-    * on etos, not an fd or a flink name — a design question deferred in
-    * idl/amdgpu.idl's header, not a translation. */
-   (void)dev; (void)bo; (void)type; (void)shared_handle;
-   return -ENOTSUP;
+   (void)dev;
+   if (!shared_handle)
+      return -EINVAL;
+
+   switch (type) {
+   case amdgpu_bo_handle_type_kms:
+   case amdgpu_bo_handle_type_kms_noimport:
+      /* Not "sharing" at all despite the name: this asks for the BO's GEM
+       * handle within *this* session, which is what the VA operations and
+       * the command stream refer to. On etos an `ac_drm_bo` carries exactly
+       * that handle, so this is a read.
+       *
+       * It matters more than it looks. The winsys takes this route to learn
+       * the handle for every buffer it maps, so returning an error here left
+       * it passing 0 to bo_va_op — every VA map failed, and the first thing
+       * that noticed was IB allocation, several layers away from the cause. */
+      *shared_handle = bo_handle(bo);
+      return 0;
+
+   case amdgpu_bo_handle_type_dma_buf_fd:
+   case amdgpu_bo_handle_type_gem_flink_name:
+      /* These are the real cross-process ones, and etos has no fds or flink
+       * names to hand out — sharing a buffer here means passing the
+       * `AmdgpuBo` capability itself, a design question deferred in
+       * idl/amdgpu.idl's header rather than a translation. */
+      return -ENOTSUP;
+
+   default:
+      return -EINVAL;
+   }
 }
 
 int ac_drm_bo_import(ac_drm_device *dev, enum amdgpu_bo_handle_type type,
@@ -591,8 +622,11 @@ int ac_drm_bo_va_op_raw(ac_drm_device *dev, uint32_t bo_handle_in, uint64_t offs
                         uint64_t addr, uint64_t flags, uint32_t ops)
 {
    (void)dev;
-   if (etos_amdgpu_va_op(bo_handle_in, ops, addr, offset, size, flags) != 0)
+   if (etos_amdgpu_va_op(bo_handle_in, ops, addr, offset, size, flags) != 0) {
+      fprintf(stderr, "etos: va_op failed: handle=%u ops=%u addr=%llx size=%llu\n",
+              bo_handle_in, ops, (unsigned long long)addr, (unsigned long long)size);
       return -EINVAL;
+   }
    return 0;
 }
 
@@ -635,8 +669,11 @@ int ac_drm_bo_va_op_raw2(ac_drm_device *dev, uint32_t bo_handle_in, uint64_t off
 
       r = etos_amdgpu_syncobj_wait(fences, num_syncobj_handles, UINT64_MAX,
                                    DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, &first);
-      if (r)
+      if (r) {
+         fprintf(stderr, "etos: va_op input-fence wait failed (%u fences)\n",
+                 num_syncobj_handles);
          return -EINVAL;
+      }
    }
 
    r = ac_drm_bo_va_op_raw(dev, bo_handle_in, offset, size, addr, flags, ops);
@@ -645,8 +682,11 @@ int ac_drm_bo_va_op_raw2(ac_drm_device *dev, uint32_t bo_handle_in, uint64_t off
 
    if (vm_timeline_syncobj_out) {
       r = etos_amdgpu_syncobj_timeline_signal(&vm_timeline_syncobj_out, &vm_timeline_point, 1);
-      if (r)
+      if (r) {
+         fprintf(stderr, "etos: va_op timeline signal failed: syncobj=%u point=%llu\n",
+                 vm_timeline_syncobj_out, (unsigned long long)vm_timeline_point);
          return -EINVAL;
+      }
    }
    return 0;
 }
@@ -678,8 +718,14 @@ int ac_drm_va_range_alloc(ac_drm_device *dev, enum amdgpu_gpu_va_range va_range_
    if (va_base_alignment > 1)
       base = (base + va_base_alignment - 1) & ~(va_base_alignment - 1);
 
-   if (base < lo || base + size > hi)
+   if (base < lo || base + size > hi) {
+      fprintf(stderr,
+              "etos: va_range_alloc out of room: want32=%d size=%llu base=%llx "
+              "window=[%llx,%llx)\n",
+              (int)want32, (unsigned long long)size, (unsigned long long)base,
+              (unsigned long long)lo, (unsigned long long)hi);
       return -ENOMEM;
+   }
 
    va = calloc(1, sizeof(*va));
    if (!va)
