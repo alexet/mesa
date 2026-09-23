@@ -831,6 +831,19 @@ int ac_drm_cs_query_fence_status(ac_drm_device *dev, uint32_t ctx_id, uint32_t i
    return 0;
 }
 
+/* Bytes the entry array of a BO_HANDLES chunk occupies. Zero if the chunk
+ * is too short to hold a `drm_amdgpu_bo_list_in` at all — a malformed chunk
+ * drmd will reject, which is where that belongs. */
+static uint32_t bo_list_entries_len(const struct drm_amdgpu_cs_chunk *chunk)
+{
+   const struct drm_amdgpu_bo_list_in *bl;
+
+   if (chunk->length_dw * 4 < sizeof(struct drm_amdgpu_bo_list_in))
+      return 0;
+   bl = (const struct drm_amdgpu_bo_list_in *)(uintptr_t)chunk->chunk_data;
+   return bl->bo_number * bl->bo_info_size;
+}
+
 /*
  * Flatten Mesa's chunk array into the payload idl/amdgpu.idl describes and
  * drivers/drmd/kpi/session.c parses:
@@ -843,6 +856,16 @@ int ac_drm_cs_query_fence_status(ac_drm_device *dev, uint32_t ctx_id, uint32_t i
  * which means nothing to drmd, so it becomes an offset into the same
  * payload. Everything a chunk *names* — BO handles, GPU virtual addresses,
  * syncobj handles — is already session-relative and crosses unchanged.
+ *
+ * One chunk needs the same treatment a second level down, and every real
+ * submission carries it: `AMDGPU_CHUNK_ID_BO_HANDLES`, whose payload is a
+ * `struct drm_amdgpu_bo_list_in` pointing at the array of BO list entries
+ * through `bo_info_ptr`. That array is appended to the payload too, and
+ * `bo_info_ptr` becomes its byte offset — the same rule, so drmd applies
+ * the same rewrite. (The alternative, an explicit BoList object in the
+ * protocol, is what idl/amdgpu.idl deliberately does not have: the list is
+ * per-submission state, not a capability, and inlining it keeps a
+ * submission one RPC.)
  */
 int ac_drm_cs_submit_raw2(ac_drm_device *dev, uint32_t ctx_id, uint32_t bo_list_handle,
                           int num_chunks, struct drm_amdgpu_cs_chunk *chunks, uint64_t *seq_no)
@@ -865,6 +888,8 @@ int ac_drm_cs_submit_raw2(ac_drm_device *dev, uint32_t ctx_id, uint32_t bo_list_
       /* Each blob padded to 8, so the payload layout does not depend on
        * chunk ordering. drmd itself only requires dword alignment. */
       total += (chunks[i].length_dw * 4 + 7) & ~7u;
+      if (chunks[i].chunk_id == AMDGPU_CHUNK_ID_BO_HANDLES)
+         total += (bo_list_entries_len(&chunks[i]) + 7) & ~7u;
    }
 
    payload = calloc(1, total);
@@ -883,6 +908,18 @@ int ac_drm_cs_submit_raw2(ac_drm_device *dev, uint32_t ctx_id, uint32_t bo_list_
       wire[i].chunk_data = off;
       memcpy(payload + off, (const void *)(uintptr_t)chunks[i].chunk_data, len);
       off += (len + 7) & ~7u;
+
+      if (chunks[i].chunk_id == AMDGPU_CHUNK_ID_BO_HANDLES) {
+         const struct drm_amdgpu_bo_list_in *src =
+            (const struct drm_amdgpu_bo_list_in *)(uintptr_t)chunks[i].chunk_data;
+         struct drm_amdgpu_bo_list_in *dst =
+            (struct drm_amdgpu_bo_list_in *)(payload + wire[i].chunk_data);
+         uint32_t entries_len = bo_list_entries_len(&chunks[i]);
+
+         memcpy(payload + off, (const void *)(uintptr_t)src->bo_info_ptr, entries_len);
+         dst->bo_info_ptr = off;
+         off += (entries_len + 7) & ~7u;
+      }
    }
 
    r = etos_amdgpu_submit(ctx_id, payload, total, seq_no);
