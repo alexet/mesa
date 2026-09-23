@@ -8,6 +8,10 @@
 #include "drm-uapi/drm_fourcc.h"
 #include "gfx/si_gfx.h"
 #include "si_pipe.h"
+#ifdef HAVE_ETOS_AMDGPU
+/* utility/amdgpu-glue — see the etos block in si_texture_create. */
+int etos_amdgpu_scanout_hint_matches(unsigned width, unsigned height);
+#endif
 #include "si_query.h"
 #include "frontend/drm_driver.h"
 #include "util/format/u_format.h"
@@ -1542,6 +1546,35 @@ si_texture_create_with_modifier(struct pipe_screen *screen,
 struct pipe_resource *si_texture_create(struct pipe_screen *screen,
                                         const struct pipe_resource *templ)
 {
+#ifdef HAVE_ETOS_AMDGPU
+   /* etos: a surface the client intends to *present* has to be laid out so
+    * the display block can read it, and on this path that means linear.
+    *
+    * There is no route from an etos client down to a `pipe_resource`
+    * template — it asks for a GL renderbuffer — so the request arrives as
+    * a hint armed just before the allocating GL call and matched here by
+    * size, the same shape (and the same caveats) as
+    * `utility/virgl-glue`'s `etos_virgl_hint_next_resource_scanout`.
+    *
+    * Linear rather than a displayable tiling mode because drmd builds the
+    * framebuffer with no format modifier, so amdgpu takes the BO's tiling
+    * flags — which a plain `amdgpu_gem_create` BO does not have — and
+    * reads it as linear. Telling the hardware one thing and the allocator
+    * another is how you get a picture that is almost right, which is
+    * worse than one that is obviously wrong. Carrying the modifier through
+    * `idl/display.idl` is the way to have both, and is not done yet.
+    */
+   if (etos_amdgpu_scanout_hint_matches(templ->width0, templ->height0) &&
+       templ->target == PIPE_TEXTURE_2D && templ->nr_samples <= 1 &&
+       templ->depth0 == 1 && templ->last_level == 0) {
+      struct pipe_resource scanout_templ = *templ;
+
+      scanout_templ.flags |= SI_RESOURCE_FLAG_FORCE_LINEAR;
+      scanout_templ.bind |= PIPE_BIND_SCANOUT;
+      return si_texture_create_with_modifier(screen, &scanout_templ,
+                                             DRM_FORMAT_MOD_INVALID);
+   }
+#endif
    return si_texture_create_with_modifier(screen, templ, DRM_FORMAT_MOD_INVALID);
 }
 
