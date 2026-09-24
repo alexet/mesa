@@ -1989,7 +1989,15 @@ endif
 
 llvm_modules = ['bitwriter', 'engine', 'mcdisassembler', 'mcjit', 'core', 'executionengine', 'scalaropts', 'transformutils', 'instcombine']
 llvm_optional_modules = ['coroutines']
-if with_amd_vk or with_gallium_radeonsi
+# `and amd_with_llvm`, which the equivalent check at the dep_llvm site below
+# already has: these modules exist for radeonsi's LLVM shader backend, and
+# with -Damd-use-llvm=false (ACO) nothing in the build calls into them. The
+# difference matters for a build that enables radeonsi *and* LLVM for some
+# other driver — llvmpipe, say — against an LLVM cross-built without the
+# AMDGPU target: without this, the whole LLVM dependency is reported missing
+# ("amdgpu(missing)") and llvmpipe cannot be built either, over a backend
+# that would never have been used.
+if (with_amd_vk or with_gallium_radeonsi) and amd_with_llvm
   llvm_modules += ['amdgpu', 'bitreader', 'ipo']
 endif
 if with_clc
